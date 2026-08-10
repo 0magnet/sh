@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/u-root/u-root v0.15.1-0.20251208185023-2f8c7e763cf8
-	mvdan.cc/sh/v3 v3.11.0
+	github.com/0magnet/sh/v3 v3.11.0
 )
 
 require (

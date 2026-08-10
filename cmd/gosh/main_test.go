@@ -14,7 +14,7 @@ import (
 	"github.com/go-quicktest/qt"
 	"github.com/rogpeppe/go-internal/testscript"
 
-	"mvdan.cc/sh/v3/interp"
+	"github.com/0magnet/sh/v3/interp"
 )
 
 func TestMain(m *testing.M) {

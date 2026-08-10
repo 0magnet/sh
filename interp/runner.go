@@ -23,10 +23,10 @@ import (
 	"sync"
 	"time"
 
-	"mvdan.cc/sh/v3/expand"
-	"mvdan.cc/sh/v3/internal"
-	"mvdan.cc/sh/v3/pattern"
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/0magnet/sh/v3/expand"
+	"github.com/0magnet/sh/v3/internal"
+	"github.com/0magnet/sh/v3/pattern"
+	"github.com/0magnet/sh/v3/syntax"
 )
 
 const (

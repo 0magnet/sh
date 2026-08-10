@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"mvdan.cc/sh/v3/pattern"
+	"github.com/0magnet/sh/v3/pattern"
 )
 
 // ExtendedPatternMatcher returns a [regexp.Regexp.MatchString]-like function
