@@ -99,7 +99,7 @@ func (r *Runner) binTest(ctx context.Context, op syntax.BinTestOperator, x, y st
 		if err1 != nil || err2 != nil {
 			return false
 		}
-		return os.SameFile(info1, info2)
+		return sameFile(info1, info2)
 	case syntax.TsEql:
 		return atoi(x) == atoi(y)
 	case syntax.TsNeq:
