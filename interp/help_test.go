@@ -26,7 +26,7 @@ func runSrc(t *testing.T, src string) string {
 
 func TestHelpBuiltin(t *testing.T) {
 	all := runSrc(t, "help")
-	for _, want := range []string{"defined internally", "A star (*)", "cd [-L|[-P [-e]]] [dir]", "*jobs"} {
+	for _, want := range []string{"defined internally", "A star (*)", "cd [-L|[-P [-e]]] [dir]", "*ulimit"} {
 		if !strings.Contains(all, want) {
 			t.Fatalf("help output missing %q:\n%s", want, all[:min(400, len(all))])
 		}
@@ -48,7 +48,11 @@ func TestHelpBuiltin(t *testing.T) {
 		t.Fatalf("miss = %q", miss)
 	}
 	// an unimplemented builtin is disclosed, not silently listed
-	if j := runSrc(t, "help jobs"); !strings.Contains(j, "not implemented") {
+	if u := runSrc(t, "help ulimit"); !strings.Contains(u, "not implemented") {
+		t.Fatalf("help ulimit = %q", u)
+	}
+	// one that works differently here says so
+	if j := runSrc(t, "help jobs"); !strings.Contains(j, "controlling terminal") {
 		t.Fatalf("help jobs = %q", j)
 	}
 }
