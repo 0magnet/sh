@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"mvdan.cc/sh/v3/interp"
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/0magnet/sh/v3/interp"
+	"github.com/0magnet/sh/v3/syntax"
 )
 
 func TestJobsBuiltin(t *testing.T) {

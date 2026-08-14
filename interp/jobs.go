@@ -23,7 +23,7 @@ import (
 	"strconv"
 	"strings"
 
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/0magnet/sh/v3/syntax"
 )
 
 // StopJobs cancels every background job this runner started, disowned ones

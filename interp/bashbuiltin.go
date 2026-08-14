@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"mvdan.cc/sh/v3/expand"
+	"github.com/0magnet/sh/v3/expand"
 )
 
 // posixSpecialBuiltins are the ones POSIX calls special, listed by `enable -s`.

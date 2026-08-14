@@ -15,7 +15,7 @@ import (
 	"testing"
 
 	"github.com/creack/pty"
-	"mvdan.cc/sh/v3/interp"
+	"github.com/0magnet/sh/v3/interp"
 )
 
 func TestRunnerTerminalStdIO(t *testing.T) {

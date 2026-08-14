@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/go-quicktest/qt"
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/0magnet/sh/v3/syntax"
 )
 
 func parseWord(t *testing.T, src string) *syntax.Word {
