@@ -5,6 +5,7 @@ package syntax
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"os"
 	"regexp"
@@ -31,7 +32,7 @@ func TestPrintFiles(t *testing.T) {
 				}
 				t.Run("", func(t *testing.T) {
 					in := c.inputs[0]
-					printTest(t, parser, printer, in, in)
+					printTest(t, parser, printer, in, cmp.Or(c.printedAs, in))
 				})
 			}
 		})
@@ -97,6 +98,8 @@ var printTests = []printCase{
 	samePrint(">&2 foo"),
 	samePrint(">&2 foo 2>&1 bar <f"),
 	{"foo >&2>/dev/null", "foo >&2 >/dev/null"},
+	samePrint("exec {foo[1]}>&-"),
+	samePrint("exec {foo}>&-"),
 	{"foo <<EOF bar\nl1\nEOF", "foo bar <<EOF\nl1\nEOF"},
 	samePrint("foo <<\\\\\\\\EOF\nbar\n\\\\EOF"),
 	samePrint("foo <<\"\\EOF\"\nbar\n\\EOF"),
@@ -1257,7 +1260,6 @@ func printTest(t *testing.T, parser *Parser, printer *Printer, in, want string) 
 	if err != nil {
 		t.Fatalf("parsing got an error: %s:\n%s", err, in)
 	}
-	origWant := want
 	want += "\n"
 	got, err := strPrint(printer, prog)
 	if err != nil {
@@ -1267,11 +1269,9 @@ func printTest(t *testing.T, parser *Parser, printer *Printer, in, want string) 
 		t.Fatalf("Print mismatch:\nwant:\n%q\ngot:\n%q", want, got)
 	}
 
-	// With the original "want" output string,
+	// With the "want" output string, including the added trailing newline,
 	// make sure that it's idempotent when formatted again.
-	// Note that we don't want the added newline,
-	// as that can change the meaning of trailing backslashes.
-	progAgain, err := parser.Parse(strings.NewReader(origWant), "")
+	progAgain, err := parser.Parse(strings.NewReader(want), "")
 	if err != nil {
 		t.Fatalf("Result is not valid shell:\n%s", want)
 	}

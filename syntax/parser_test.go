@@ -500,6 +500,10 @@ var errorCases = []errorCase{
 		langErr("1:1: reached EOF without matching `${` with `}`", LangMirBSDKorn),
 	),
 	errCase(
+		`${ { foo; }bar; }`,
+		langErr("1:12: statements must be separated by &, ; or a newline", LangBash|LangMirBSDKorn),
+	),
+	errCase(
 		"((foo\x80bar",
 		langErr("1:6: invalid UTF-8 encoding"),
 	),
@@ -2681,6 +2685,10 @@ func TestParseRecoverErrors(t *testing.T) {
 		},
 		{
 			src:         "$((incomp",
+			wantMissing: 1,
+		},
+		{
+			src:         "$[incomp",
 			wantMissing: 1,
 		},
 		{

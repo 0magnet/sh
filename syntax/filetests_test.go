@@ -124,6 +124,10 @@ func fullProg(v any) *File {
 type fileTestCase struct {
 	inputs []string // input sources; the first is the canonical formatting
 
+	// printedAs is the canonical formatting when it differs from inputs[0],
+	// such as a lone trailing backslash being escaped by the printer.
+	printedAs string
+
 	// Each language in [langResolvedVariants] has an entry:
 	// - nil:    nothing to test
 	// - *File:  parse as the given syntax tree
@@ -163,6 +167,10 @@ func fileTest(in []string, opts ...func(*fileTestCase)) fileTestCase {
 	return c
 }
 
+func printsAs(s string) func(*fileTestCase) {
+	return func(c *fileTestCase) { c.printedAs = s }
+}
+
 func langSkip(langSets ...LangVariant) func(*fileTestCase) {
 	return func(c *fileTestCase) { c.setForLangs(nil, langSets...) }
 }
@@ -192,11 +200,22 @@ var fileTests = []fileTestCase{
 	),
 	fileTest(
 		[]string{`\`},
+		printsAs(`\\`),
 		langFile(litWord(`\`)),
 	),
 	fileTest(
 		[]string{`foo\`, "f\\\noo\\"},
+		printsAs(`foo\\`),
 		langFile(litWord(`foo\`)),
+	),
+	fileTest(
+		[]string{`foo\\`},
+		langFile(litWord(`foo\\`)),
+	),
+	fileTest(
+		[]string{`foo\\\`},
+		printsAs(`foo\\\\`),
+		langFile(litWord(`foo\\\`)),
 	),
 	fileTest(
 		[]string{`foo\a`, "f\\\noo\\a"},
@@ -1824,6 +1843,16 @@ var fileTests = []fileTestCase{
 			},
 		}, LangBash|LangZsh),
 	),
+	// Only bash allows an array element as the fd variable. See issue #719.
+	fileTest(
+		[]string{"foo {fds[3]}<f"},
+		langFile(&Stmt{
+			Cmd: litCall("foo"),
+			Redirs: []*Redirect{
+				{Op: RdrIn, N: lit("{fds[3]}"), Word: litWord("f")},
+			},
+		}, LangBash),
+	),
 	fileTest(
 		[]string{"! foo"},
 		langFile(&Stmt{
@@ -2077,6 +2106,28 @@ var fileTests = []fileTestCase{
 			word(cmdSubst(litStmt("foo", "bar"))),
 		)))),
 	),
+	// In a backquote command substitution within double quotes,
+	// backslashes escape double quotes as well. See issue #1083.
+	fileTest(
+		[]string{
+			`"$(echo "foobar")"`,
+			"\"`echo \\\"foobar\\\"`\"",
+		},
+		langFile(word(dblQuoted(cmdSubst(stmt(call(
+			litWord("echo"),
+			word(dblQuoted(lit("foobar"))),
+		)))))),
+	),
+	fileTest(
+		[]string{
+			`"$(echo '"')"`,
+			"\"`echo '\\\"'`\"",
+		},
+		langFile(word(dblQuoted(cmdSubst(stmt(call(
+			litWord("echo"),
+			word(sglQuoted(`"`)),
+		)))))),
+	),
 	fileTest(
 		[]string{"$( (a) | b)"},
 		langFile(cmdSubst(
@@ -2226,6 +2277,30 @@ var fileTests = []fileTestCase{
 			Stmts:    litStmts("foo", "bar"),
 			ReplyVar: true,
 		}, LangBash|LangMirBSDKorn),
+	),
+	fileTest(
+		[]string{`"${ foo;}"`, `"${ foo; }"`},
+		langFile(dblQuoted(&CmdSubst{
+			Stmts:    litStmts("foo"),
+			TempFile: true,
+		}), LangBash|LangMirBSDKorn),
+		langErr2("1:2: `${ stmts;}` is a bash/mksh feature; tried parsing as LANG", LangPOSIX),
+	),
+	fileTest(
+		[]string{`"${|foo;}"`, `"${| foo; }"`},
+		langFile(dblQuoted(&CmdSubst{
+			Stmts:    litStmts("foo"),
+			ReplyVar: true,
+		}), LangBash|LangMirBSDKorn),
+		langErr2("1:2: `${|stmts;}` is a bash/mksh feature; tried parsing as LANG", LangPOSIX),
+	),
+	fileTest(
+		[]string{`${ foo;}bar`},
+		langFile(word(&CmdSubst{
+			Stmts:    litStmts("foo"),
+			TempFile: true,
+		}, lit("bar")), LangBash|LangMirBSDKorn),
+		langErr2("1:1: `${ stmts;}` is a bash/mksh feature; tried parsing as LANG", LangPOSIX),
 	),
 	fileTest(
 		[]string{`"$foo"`},
