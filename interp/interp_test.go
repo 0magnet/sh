@@ -246,6 +246,13 @@ var runTests = []runTest{
 	// times
 	{"times", "0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n #IGNORE we report zeros; bash reports real CPU time"},
 
+	// umask
+	{"umask", "0022\n"},
+	{"umask -S", "u=rwx,g=rx,o=rx\n"},
+	{"umask 077; umask", "0077\n"},
+	{"umask 077; umask -S", "u=rwx,g=,o=\n"},
+	{"umask 8", "umask: 8: octal number expected\nexit status 2 #IGNORE bash words the error differently"},
+
 	// exit status codes
 	{"exit 1", "exit status 1"},
 	{"exit -1", "exit status 255"},
@@ -5208,6 +5215,54 @@ func TestRunnerDir(t *testing.T) {
 			t.Fatalf("\nwant regexp: %q\ngot: %q", want, got)
 		}
 	})
+}
+
+// TestRunnerUmask checks that a redirection creates files with 0666 masked by
+// the shell's umask, as in bash. It cannot be a runTests case: printing a file
+// mode needs an external command, and interp has no builtin which reports one.
+func TestRunnerUmask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes on windows do not work this way")
+	}
+	t.Parallel()
+
+	tests := []struct {
+		umask string
+		want  os.FileMode
+	}{
+		{"022", 0o644},
+		{"077", 0o600},
+		{"002", 0o664},
+		{"000", 0o666},
+	}
+	for _, tc := range tests {
+		t.Run(tc.umask, func(t *testing.T) {
+			t.Parallel()
+			tdir := t.TempDir()
+			file := filepath.Join(tdir, "f")
+			src := "umask " + tc.umask + "; echo hi >" + file
+			f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := interp.New(interp.Dir(tdir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Run(t.Context(), f); err != nil {
+				t.Fatal(err)
+			}
+			fi, err := os.Stat(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The process umask applies on top of the shell's, since the
+			// kernel enforces it, so only check that no extra bits are set.
+			if got := fi.Mode().Perm(); got&^tc.want != 0 {
+				t.Fatalf("umask %s: file mode is %04o, want no bits beyond %04o", tc.umask, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestRunnerIncremental(t *testing.T) {
