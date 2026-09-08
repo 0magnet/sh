@@ -1,15 +1,15 @@
 module github.com/0magnet/sh/v3
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/creack/pty v1.1.24
 	github.com/go-quicktest/qt v1.102.0
 	github.com/google/go-cmp v0.7.0
 	github.com/google/renameio/v2 v2.0.2
-	github.com/rogpeppe/go-internal v1.15.0
-	golang.org/x/sys v0.47.0
-	golang.org/x/term v0.45.0
+	github.com/rogpeppe/go-internal v1.16.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/term v0.46.0
 	mvdan.cc/editorconfig v0.3.0
 )
 
