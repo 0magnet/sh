@@ -11,14 +11,69 @@ import (
 	"github.com/0magnet/sh/v3/syntax"
 )
 
+// session runs several sources on one runner, so that a test can observe the
+// job table between commands the way an interactive shell does.
+type session struct {
+	t   *testing.T
+	r   *interp.Runner
+	out *strings.Builder
+}
+
+func newSession(t *testing.T) *session {
+	t.Helper()
+	out := new(strings.Builder)
+	r, err := interp.New(interp.StdIO(strings.NewReader(""), out, out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &session{t: t, r: r, out: out}
+}
+
+// run executes src and returns only what it printed.
+func (s *session) run(src string) string {
+	s.t.Helper()
+	before := s.out.Len()
+	f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	_ = s.r.Run(context.Background(), f)
+	return s.out.String()[before:]
+}
+
+// jobsUntil runs the jobs builtin until its output contains want, giving the
+// background goroutine time to finish without a fixed sleep. Note that jobs
+// only reaps what it reports as finished, so polling it leaves a running job
+// in the table.
+func (s *session) jobsUntil(want string) string {
+	s.t.Helper()
+	var last string
+	for range 400 {
+		last = s.run("jobs")
+		if strings.Contains(last, want) {
+			return last
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.t.Fatalf("jobs never reported %q; last listing was %q", want, last)
+	return ""
+}
 func TestJobsBuiltin(t *testing.T) {
 	t.Parallel()
-	// A finished job reports Done, and a failed one its exit status.
-	if s := runSrc(t, "sleep 0 & wait; jobs"); !strings.Contains(s, "[1]+  Done") || !strings.Contains(s, "sleep 0") {
-		t.Fatalf("jobs after wait = %q", s)
+	// A finished job reports Done, and a failed one its exit status. Waiting
+	// for one reaps it, as in bash, so the listing has to come first.
+	s0 := newSession(t)
+	s0.run("sleep 0 &")
+	if got := s0.jobsUntil("Done"); !strings.Contains(got, "[1]+") || !strings.Contains(got, "sleep 0") {
+		t.Fatalf("jobs after the job ended = %q", got)
 	}
-	if s := runSrc(t, "(exit 3) & wait; jobs"); !strings.Contains(s, "Exit 3") {
-		t.Fatalf("jobs after failure = %q", s)
+	if got := s0.run("jobs"); got != "" {
+		t.Fatalf("a reported job was listed again: %q", got)
+	}
+	s1 := newSession(t)
+	s1.run("(exit 3) &")
+	if got := s1.jobsUntil("Exit 3"); got == "" {
+		t.Fatalf("jobs after failure = %q", got)
 	}
 	// A running job reports Running, and -p prints only the fake pids that
 	// $! also reports.
@@ -44,16 +99,20 @@ func TestJobsBuiltin(t *testing.T) {
 
 func TestKillBuiltin(t *testing.T) {
 	t.Parallel()
-	// Killing a job cancels it, which jobs then reports as Terminated.
-	s := runSrc(t, "sleep 30 & kill %1; wait; jobs")
-	if !strings.Contains(s, "Terminated") {
-		t.Fatalf("jobs after kill = %q", s)
-	}
-	// Job specs: by number, by fake pid, by command prefix, and by substring.
-	for _, spec := range []string{"%1", "1", "g1", "%sleep", "%?leep"} {
-		s := runSrc(t, "sleep 30 & kill "+spec+"; wait; jobs")
-		if !strings.Contains(s, "Terminated") {
-			t.Fatalf("kill %s = %q", spec, s)
+	// Killing a job cancels it, which jobs then reports as Terminated, and
+	// reporting it reaps it.
+	//
+	// Job specs: by number, by the fake pid $! reports, by command prefix and
+	// by substring. A bare integer is not among them any more: it is a PID
+	// and never a job number, as in bash.
+	for _, spec := range []string{"%1", "g1", "%sleep", "%?leep"} {
+		k := newSession(t)
+		k.run("sleep 30 & kill " + spec)
+		if got := k.jobsUntil("Terminated"); !strings.Contains(got, "sleep 30") {
+			t.Fatalf("kill %s listed %q", spec, got)
+		}
+		if got := k.run("jobs"); got != "" {
+			t.Fatalf("kill %s left %q behind", spec, got)
 		}
 	}
 	// Signal 0 only tests that the job exists.
@@ -82,10 +141,9 @@ func TestKillBuiltin(t *testing.T) {
 	}
 	// Both spellings of the signal reach the job.
 	for _, flag := range []string{"-9", "-KILL", "-SIGKILL", "-s KILL", "-n 9"} {
-		s := runSrc(t, "sleep 30 & kill "+flag+" %1; wait; jobs")
-		if !strings.Contains(s, "Terminated") {
-			t.Fatalf("kill %s = %q", flag, s)
-		}
+		k := newSession(t)
+		k.run("sleep 30 & kill " + flag + " %1")
+		k.jobsUntil("Terminated")
 	}
 }
 
@@ -108,8 +166,10 @@ func TestDisownFgBg(t *testing.T) {
 	if s := runSrc(t, "sleep 30 & bg; kill %1"); !strings.Contains(s, "[1]+ sleep 30 &") {
 		t.Fatalf("bg = %q", s)
 	}
-	if s := runSrc(t, "sleep 0 & wait; bg"); !strings.Contains(s, "has terminated") {
-		t.Fatalf("bg on finished job = %q", s)
+	// wait reaps the job, so by the time bg runs there is no current job at
+	// all, which is what bash says too.
+	if s := runSrc(t, "sleep 0 & wait; bg"); !strings.Contains(s, "no such job") {
+		t.Fatalf("bg after the job was reaped = %q", s)
 	}
 }
 
