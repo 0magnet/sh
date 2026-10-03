@@ -18,9 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0magnet/sh/v3/internal"
 	"github.com/go-quicktest/qt"
 	"github.com/google/go-cmp/cmp"
-	"github.com/0magnet/sh/v3/internal"
 )
 
 func TestParseFiles(t *testing.T) {
@@ -202,6 +202,47 @@ func TestParsePosOverflow(t *testing.T) {
 			if got != test.want {
 				t.Fatalf("want error %q, got %q", test.want, got)
 			}
+		})
+	}
+}
+
+func TestParseNestingLimit(t *testing.T) {
+	t.Parallel()
+
+	nest := func(n int, open, mid, close string) string {
+		return strings.Repeat(open, n) + mid + strings.Repeat(close, n)
+	}
+	tests := []struct {
+		name string
+		in   func(n int) string
+	}{
+		{"Subshell", func(n int) string { return nest(n, "(\n", ":", ")\n") }},
+		{"FuncBody", func(n int) string { return nest(n, "f() ", "{ :; }", "") }},
+		{"CmdSubst", func(n int) string { return nest(n, "$(", ":", ")") }},
+		{"ParamExp", func(n int) string { return nest(n, "${a:-", "x", "}") }},
+		{"AndChain", func(n int) string { return nest(n, ":&&\n", ":", "") }},
+		{"Pipeline", func(n int) string { return nest(n, ":|\n", ":", "") }},
+		{"ElifChain", func(n int) string { return nest(n, "if :; then :\nel", "if :; then :\n", "") + "fi" }},
+		{"ArithmParens", func(n int) string { return "((" + nest(n, "(", "1", ")") + "))" }},
+		{"ArithmAssign", func(n int) string { return "((" + nest(n, "a=", "1", "") + "))" }},
+		{"ArithmChain", func(n int) string { return "((" + nest(n, "1+", "1", "") + "))" }},
+		{"TestNot", func(n int) string { return "[[ " + nest(n, "! ", "x", "") + " ]]" }},
+		{"TestAndChain", func(n int) string { return "[[ " + nest(n, "x && ", "x", "") + " ]]" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if runtime.GOOS == "js" && strings.HasPrefix(test.name, "Arithm") {
+				// Each Go call is a wasm call, and arithmetic expressions
+				// recurse through many functions per level.
+				t.Skip("deep arithmetic recursion overflows the V8 stack")
+			}
+			t.Parallel()
+
+			p := NewParser()
+			_, err := p.Parse(strings.NewReader(test.in(1000)), "")
+			qt.Assert(t, qt.IsNil(err))
+			_, err = p.Parse(strings.NewReader(test.in(maxNesting+1)), "")
+			qt.Assert(t, qt.ErrorMatches(err, `.*: nesting is deeper than 10000 levels`))
 		})
 	}
 }
@@ -416,10 +457,6 @@ func flipConfirm(langSet LangVariant) func(*errorCase) {
 }
 
 var flipConfirmAll = flipConfirm(langResolvedVariants)
-
-// The real shells which allow unclosed heredocs.
-// TODO: allow ending a heredoc at EOF in these language variant modes.
-var flipConfirmUnclosedHeredoc = flipConfirm(LangBash | LangPOSIX | LangBats | LangZsh)
 
 func init() {
 	seenInputs := make(map[string]bool)
@@ -831,67 +868,56 @@ var errorCases = []errorCase{
 	),
 	errCase(
 		"<<EOF",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<EOF\n\\",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<EOF\n\\\n",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<EOF\n\\\nEOF",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmAll, // why does mksh allow this?
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
+		flipConfirm(LangMirBSDKorn), // why does mksh allow this?
 	),
 	errCase(
 		"<<EOF\nfoo\\\nEOF",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<'EOF'\n\\\n",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<EOF <`\n#\n`\n``",
-		langErr("1:1: unclosed here-document `EOF`"),
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<'EOF'",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<\\EOF",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<\\\\EOF",
-		langErr("1:1: unclosed here-document `\\EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `\\EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<-EOF",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<-EOF\n\t",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<-'EOF'\n\t",
-		langErr("1:1: unclosed here-document `EOF`"),
-		flipConfirmUnclosedHeredoc,
+		langErr("1:1: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"<<\nEOF\nbar\nEOF",
@@ -899,14 +925,13 @@ var errorCases = []errorCase{
 	),
 	errCase(
 		"$(<<EOF\nNOTEOF)",
-		langErr("1:3: unclosed here-document `EOF`", LangBash|LangMirBSDKorn),
+		langErr("1:1: reached EOF without matching `$(` with `)`", LangBash),
+		langErr("1:3: unclosed here-document `EOF`", LangMirBSDKorn),
 		// Note that this fails on external shells as they treat ")" as part of the heredoc.
 	),
 	errCase(
 		"`<<EOF\nNOTEOF`",
-		langErr("1:2: unclosed here-document `EOF`", LangBash|LangMirBSDKorn),
-		flipConfirmAll,
-		// Note that this works on external shells as they treat "`" as outside the heredoc.
+		langErr("1:2: unclosed here-document `EOF`", LangMirBSDKorn),
 	),
 	errCase(
 		"if",
@@ -1918,6 +1943,12 @@ var errorCases = []errorCase{
 		langErr("1:6: reached EOF without matching `${` with `}`", LangBash|LangMirBSDKorn),
 	),
 	errCase(
+		// A slice is always arithmetic, unlike a subscript such as ${foo[1,#]}.
+		"echo ${foo:1:#2}",
+		langErr("1:13: `:` must be followed by an expression", LangBash|LangMirBSDKorn|LangZsh),
+		flipConfirmAll, // the shells only fail at expansion time
+	),
+	errCase(
 		"echo ${foo:h",
 		langErr("1:6: reached EOF without matching `${` with `}`", LangZsh),
 	),
@@ -2192,7 +2223,8 @@ func TestParseStmtsSeqError(t *testing.T) {
 		"bar; <<EOF",
 	} {
 		t.Run("", func(t *testing.T) {
-			p := NewParser()
+			// Other variants allow unclosed heredocs.
+			p := NewParser(Variant(LangMirBSDKorn))
 			recv := make(chan bool, 10)
 			errc := make(chan error, 1)
 			go func() {
@@ -2465,6 +2497,12 @@ var stopAtTests = []struct {
 		"echo '$$'", "$$",
 		call(litWord("echo"), word(sglQuoted("$$"))),
 	},
+	{
+		// A trailing backslash empties the read buffer as we peek at what
+		// follows it, so the stop word cannot be matched against it.
+		"\\", "0",
+		litCall("\\"),
+	},
 }
 
 func TestParseStopAt(t *testing.T) {
@@ -2579,6 +2617,36 @@ func TestPosEdgeCases(t *testing.T) {
 	// Check that we skip over null bytes when counting columns.
 	qt.Check(t, qt.Equals(f.Stmts[1].Pos().String(), "2:2"))
 	qt.Check(t, qt.Equals(f.Stmts[1].End().String(), "2:9"))
+}
+
+func TestPosAddCol(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		pos        Pos
+		n          int
+		want       string // as printed by [Pos.String]
+		wantOffset uint
+	}{
+		{"Add", NewPos(10, 5, 3), 2, "5:5", 12},
+		{"Subtract", NewPos(10, 5, 3), -2, "5:1", 8},
+		{"UnknownCol", NewPos(10, 5, 0), 2, "5:?", 12},
+		{"ColOverflow", NewPos(10, 5, colMax), 2, "5:?", 12},
+		{"ColUnderflow", NewPos(10, 5, 1), -2, "5:?", 8},
+		{"OffsetOverflow", NewPos(offsetMax, 5, 3), 2, "5:5", offsetMax},
+		{"OffsetUnderflow", NewPos(0, 1, 1), -2, "1:?", 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := posAddCol(test.pos, test.n)
+			qt.Check(t, qt.IsTrue(got.IsValid()))
+			qt.Check(t, qt.Equals(got.String(), test.want))
+			qt.Check(t, qt.Equals(got.Offset(), test.wantOffset))
+		})
+	}
 }
 
 func TestParseHighControlRunes(t *testing.T) {
@@ -2805,15 +2873,15 @@ func countRecoveredPositions(x reflect.Value) int {
 		}
 		return n
 	case reflect.Struct:
-		if pos, ok := x.Interface().(Pos); ok {
+		if pos, ok := reflect.TypeAssert[Pos](x); ok {
 			if pos.IsRecovered() {
 				return 1
 			}
 			return 0
 		}
 		n := 0
-		for i := range x.NumField() {
-			n += countRecoveredPositions(x.Field(i))
+		for _, field := range x.Fields() {
+			n += countRecoveredPositions(field)
 		}
 		return n
 	}

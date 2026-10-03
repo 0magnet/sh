@@ -18,14 +18,15 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/go-quicktest/qt"
 	"github.com/0magnet/sh/v3/expand"
 	"github.com/0magnet/sh/v3/internal"
 	"github.com/0magnet/sh/v3/interp"
 	"github.com/0magnet/sh/v3/syntax"
+	"github.com/go-quicktest/qt"
 )
 
 // runnerRunTimeout is the context timeout used by any tests calling [Runner.Run].
@@ -127,8 +128,7 @@ func TestMain(m *testing.M) {
 		)
 		ctx := context.Background()
 		if err := runner.Run(ctx, file); err != nil {
-			var es interp.ExitStatus
-			if errors.As(err, &es) {
+			if es, ok := errors.AsType[interp.ExitStatus](err); ok {
 				os.Exit(int(es))
 			}
 
@@ -138,11 +138,13 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 
-	prog, err := os.Executable()
-	if err != nil {
-		panic(err)
+	if canExec {
+		prog, err := os.Executable()
+		if err != nil {
+			panic(err)
+		}
+		os.Setenv("GOSH_PROG", prog)
 	}
-	os.Setenv("GOSH_PROG", prog)
 
 	internal.TestMainSetup()
 
@@ -232,6 +234,20 @@ var runTests = []runTest{
 	{"{ :; }", ""},
 	{"(:)", ""},
 
+	// help
+	{"help -s pwd", "pwd: pwd [-LP]\n"},
+	{"help -d true", "true - Return a successful result.\n"},
+	{"help -s ec*", "echo: echo [-neE] [arg ...]\n #IGNORE bash prints a `Shell commands matching keyword' header"},
+	{"help nosuchthing", "help: no help topics match `nosuchthing'.  Try `help help'.\nexit status 1 #IGNORE bash also suggests man and info"},
+	{"help -q", "help: -q: invalid option\nhelp: usage: help [-dms] [pattern ...]\nexit status 2 #IGNORE bash prefixes its errors with `bash: line N:'"},
+	// a builtin we recognize but do not implement is starred, so that help is
+	// an honest statement of what this shell can do
+	{"help -s jobs", "jobs: jobs [-lnprs] [jobspec ...]\n #IGNORE bash implements jobs, and its synopsis differs"},
+	{"help jobs", "jobs: jobs [-lnprs] [jobspec ...]\n    Display status of jobs.\n    (nothing is ever stopped without a controlling terminal, so -s lists nothing)\n\n #IGNORE bash implements jobs"},
+
+	// times
+	{"times", "0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n #IGNORE we report zeros; bash reports real CPU time"},
+
 	// exit status codes
 	{"exit 1", "exit status 1"},
 	{"exit -1", "exit status 255"},
@@ -251,6 +267,7 @@ var runTests = []runTest{
 	{"continue", "continue is only useful in a loop\n #JUSTERR"},
 	{"cd a b", "usage: cd [dir]\nexit status 2 #JUSTERR"},
 	{"shift a", "usage: shift [n]\nexit status 2 #JUSTERR"},
+	{"set -- a b; shift -1; echo $? $@", "shift: -1: shift count out of range\n1 a b\n #JUSTERR"},
 	{
 		"shouldnotexist",
 		"\"shouldnotexist\": executable file not found in $PATH\nexit status 127 #JUSTERR",
@@ -403,6 +420,10 @@ var runTests = []runTest{
 		"before before",
 	},
 	{
+		`printf 'a\0b' | { read -r x; echo "${x@Q}"; }`,
+		"cannot quote character at byte 1: shell strings cannot contain null bytes\n #IGNORE bash drops null bytes when reading",
+	},
+	{
 		"i\x00f true; then echo before\x00; \x00fi",
 		"before\n",
 	},
@@ -509,8 +530,27 @@ var runTests = []runTest{
 	{"echo $?; false; echo $?", "0\n1\n"},
 	{"for i in 1 2; do\necho $LINENO\necho $LINENO\ndone", "2\n3\n2\n3\n"},
 	{"[[ -n $$ && $$ -gt 0 ]]", ""},
+	{"case $- in *e*) echo yes ;; *) echo no ;; esac", "no\n"},
+	{"set -e; case $- in *e*) echo yes ;; *) echo no ;; esac", "yes\n"},
+	// Bash's $- also holds flags which we don't support, such as h and B.
+	{"set -aefu; echo $-", "aefu\n #IGNORE"},
 	{"[[ $$ -eq $PPID ]]", "exit status 1"},
-	{"[[ $RANDOM -eq $RANDOM ]]", "exit status 1"},   // 1 in 32k chance of a collision, 0.003%
+	{"[[ $RANDOM -eq $RANDOM ]]", "exit status 1"}, // 1 in 32k chance of a collision, 0.003%
+	{
+		// Assigning to RANDOM seeds it, so the sequence repeats.
+		"RANDOM=42; a=$RANDOM$RANDOM; RANDOM=42; b=$RANDOM$RANDOM; [[ $a == $b ]]",
+		"",
+	},
+	{
+		"RANDOM=1; a=$RANDOM; RANDOM=2; b=$RANDOM; [[ $a != $b ]]",
+		"",
+	},
+	{
+		// A failed assignment must not seed, so that RANDOM keeps its
+		// attributes like any other variable.
+		"readonly RANDOM; RANDOM=99; echo $?",
+		"RANDOM: readonly variable\n1\n #JUSTERR",
+	},
 	{"[[ $SRANDOM -eq $SRANDOM ]]", "exit status 1"}, // 1 in 2**32 chance of a collision,
 
 	// Ensure that we consistently use 64 bits even on 32-bit platforms.
@@ -723,6 +763,34 @@ var runTests = []runTest{
 		"3\n",
 	},
 	{
+		`export INTERP_X_1; readonly INTERP_X_2; echo "[${!INTERP_X_*}]"`,
+		"[]\n",
+	},
+	{
+		`INTERP_X_1=a; unset INTERP_X_1; echo "[${!INTERP_X_*}]"`,
+		"[]\n",
+	},
+	{
+		`unset INTERP_GLOBAL; echo "[${!INTERP_*}]"`,
+		"[]\n",
+	},
+	{
+		`INTERP_X_1=a; f() { local INTERP_X_1=b; echo ${!INTERP_X_*}; }; f`,
+		"INTERP_X_1\n",
+	},
+	{
+		`INTERP_X_1=a; f() { local INTERP_X_1; echo ${!INTERP_X_*}; }; f`,
+		"INTERP_X_1\n",
+	},
+	{
+		`f() { local INTERP_X_1=a; unset INTERP_X_1; echo "[${!INTERP_X_*}]"; }; f`,
+		"[]\n",
+	},
+	{
+		`INTERP_X_1[3]=a; declare -A INTERP_X_2; INTERP_X_2[k]=b; mapfile INTERP_X_3 </dev/null; echo ${!INTERP_X_*}`,
+		"INTERP_X_1 INTERP_X_2 INTERP_X_3\n",
+	},
+	{
 		`a='b  c'; eval "echo -n ${a} ${a@Q}"`,
 		`b c b  c`,
 	},
@@ -763,6 +831,18 @@ var runTests = []runTest{
 	{
 		`export e=1; echo "${e@A}"`,
 		"declare -x e=1\n #IGNORE bash always single-quotes",
+	},
+	{
+		`export e; echo "[${e@A}]"`,
+		"[declare -x e]\n",
+	},
+	{
+		`a=1; unset a; echo "[${a@A}]"`,
+		"[]\n",
+	},
+	{
+		`a=(); echo "[${a@A}]"`,
+		"[declare -a a]\n",
 	},
 	{
 		`a=Hello; echo "${a@U}"`,
@@ -816,6 +896,10 @@ var runTests = []runTest{
 		`declare -n x; [[ -v x ]] && echo set || echo unset`,
 		"unset\n",
 	},
+	{
+		`unset ''; [[ -v '' ]] || test -R '' || echo unset`,
+		"unset\n",
+	},
 
 	// declare -f and declare -p
 	{
@@ -847,8 +931,88 @@ var runTests = []runTest{
 		"declare -r c=\"immutable\"\n",
 	},
 	{
+		`export e; declare -p e`,
+		"declare -x e\n",
+	},
+	{
+		`declare -A m; declare -p m`,
+		"declare -A m\n",
+	},
+	{
+		`declare foo; declare -p foo; echo "${foo+set}|${foo@a}|"`,
+		"declare -- foo\n||\n",
+	},
+	{
+		`declare -a foo; declare -p foo; echo "${foo+set}|${foo@a}|"`,
+		"declare -a foo\n|a|\n",
+	},
+	{
+		`typeset foo; declare -p foo`,
+		"declare -- foo\n",
+	},
+	{
+		`foo=x; declare -a foo; declare -p foo`,
+		"declare -a foo=([0]=\"x\")\n",
+	},
+	{
+		`declare -a foo; foo=x; foo+=y; declare -p foo`,
+		"declare -a foo=([0]=\"xy\")\n",
+	},
+	{
+		`f() { declare -a foo; foo=y; declare -p foo; }; f`,
+		"declare -a foo=([0]=\"y\")\n",
+	},
+	{
+		`declare foo; foo[2]=x; declare bar; bar+=(y); declare baz; : ${baz[1]:=z}; declare -p foo bar baz`,
+		"declare -a foo=([2]=\"x\")\ndeclare -a bar=([0]=\"y\")\ndeclare -a baz=([1]=\"z\")\n",
+	},
+	{
+		`declare -x foo; declare bar; export bar; $ENV_PROG | grep -E '^(foo|bar)='; echo $?`,
+		"1\n",
+	},
+	{
+		`readonly foo; declare foo; declare -p foo`,
+		"declare -r foo\n",
+	},
+	{
+		`export foo; unset foo; declare -A m; unset m; declare -p foo m 2>/dev/null; echo "exit: $?"`,
+		"exit: 1\n",
+	},
+	{
+		`f() { local l; declare -p l; }; f`,
+		"declare -- l\n",
+	},
+	{
+		`mapfile a </dev/null; declare -p a`,
+		"declare -a a=()\n",
+	},
+	{
 		`declare -p nonexistent 2>/dev/null; echo "exit: $?"`,
 		"exit: 1\n",
+	},
+	{
+		`INTERP_X_s='a b'; export INTERP_X_x=1; export INTERP_X_xu; readonly INTERP_X_r=2; declare -a INTERP_X_a=(x); declare -A INTERP_X_m; declare -n INTERP_X_n=INTERP_X_s; declare INTERP_X_u; declare -p | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'`,
+		"declare -a INTERP_X_a=([0]=\"x\")\ndeclare -A INTERP_X_m\ndeclare -n INTERP_X_n=\"INTERP_X_s\"\ndeclare -r INTERP_X_r=\"2\"\ndeclare -- INTERP_X_s=\"a b\"\ndeclare -- INTERP_X_u\ndeclare -x INTERP_X_x=\"1\"\ndeclare -x INTERP_X_xu\n",
+	},
+	{
+		`INTERP_X_s=1; export INTERP_X_x=1; export INTERP_X_xu; readonly INTERP_X_r=2; declare -r -x INTERP_X_rx=3; export | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'; readonly -p | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'`,
+		"declare -rx INTERP_X_rx=\"3\"\ndeclare -x INTERP_X_x=\"1\"\ndeclare -x INTERP_X_xu\ndeclare -r INTERP_X_r=\"2\"\ndeclare -rx INTERP_X_rx=\"3\"\n",
+	},
+	{
+		`declare -a INTERP_X_a=(x); declare -a -x INTERP_X_ax; declare -A INTERP_X_m; declare -n INTERP_X_n=INTERP_X_a; export INTERP_X_x; readonly INTERP_X_r; declare -a | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'; declare -A -p | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'; declare -n | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'`,
+		"declare -a INTERP_X_a=([0]=\"x\")\ndeclare -ax INTERP_X_ax\ndeclare -A INTERP_X_m\ndeclare -n INTERP_X_n=\"INTERP_X_a\"\n",
+	},
+	{
+		`declare -a INTERP_X_a=(x); declare -a -x INTERP_X_ax; export INTERP_X_x; readonly INTERP_X_r; declare -r -x | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'; declare -a -x | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'`,
+		"declare -ax INTERP_X_ax\ndeclare -r INTERP_X_r\ndeclare -x INTERP_X_x\ndeclare -ax INTERP_X_ax\n",
+	},
+	{
+		`INTERP_X_s=outer; f() { local; echo "rc=$?"; local INTERP_X_s=loc INTERP_X_l=1; local INTERP_X_u; local -x; g; }; g() { local INTERP_X_g=1; local; }; f`,
+		"rc=0\ndeclare -- INTERP_X_l=\"1\"\ndeclare -- INTERP_X_s=\"loc\"\ndeclare -- INTERP_X_u\ndeclare -- INTERP_X_g=\"1\"\n",
+	},
+	{
+		`export INTERP_X_x=1 INTERP_X_y=1; f() { local INTERP_X_x=shadow; unset INTERP_X_y; declare -x | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'; }; f; export | grep -E '^declare -[a-zA-Z-]+ INTERP_X_'`,
+		"declare -x INTERP_X_x=\"shadow\"\ndeclare -x INTERP_X_x=\"1\"\n",
 	},
 
 	// if
@@ -928,6 +1092,14 @@ var runTests = []runTest{
 		"until false; do break; done",
 		"",
 	},
+	{
+		"while break; do echo body; done; echo end",
+		"end\n",
+	},
+	{
+		"for i in 1 2; do until break 2; do echo body; done; done; echo $i",
+		"1\n",
+	},
 
 	// for
 	{
@@ -975,11 +1147,14 @@ var runTests = []runTest{
 		"i=0; for ((;;)); do if [ $i -ge 3 ]; then break; fi; echo $i; i=$((i+1)); done",
 		"0\n1\n2\n",
 	},
-	// TODO: uncomment once expandEnv.Set starts returning errors
-	// {
-	// 	"readonly i; for ((i=0; i<3; i++)); do echo $i; done",
-	// 	"0\n1\n2\n",
-	// },
+	{
+		"readonly i; for ((i=0; i<3; i++)); do echo $i; done",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly i; ((i=3)); echo $?; echo $i",
+		"i: readonly variable\n1\n\n #JUSTERR",
+	},
 	{
 		"for ((i=5; i>0; i--)); do echo $i; break; done",
 		"5\n",
@@ -1155,6 +1330,12 @@ var runTests = []runTest{
 	},
 	{
 		`old="$PWD"; mkdir a; cd a; [[ $old == "$OLDPWD" ]]`,
+		"",
+	},
+	{
+		// Note that absolute paths need cleaning too, not just relative ones.
+		// Compare against a relative cd to avoid depending on the separator.
+		`mkdir -p a b; cd b; ref=$PWD; cd ..; cd $PWD/a/../b; [[ $PWD == "$ref" ]]`,
 		"",
 	},
 	{
@@ -1352,6 +1533,30 @@ var runTests = []runTest{
 		"match\n",
 	},
 	{
+		"case ab in a*) echo one ;& *b) echo two ;; esac",
+		"one\ntwo\n",
+	},
+	{
+		"case ab in a*) echo one ;;& *b) echo two ;; esac",
+		"one\ntwo\n",
+	},
+	{
+		"case ab in a*) echo one ;;& *zz) echo two ;; esac",
+		"one\n",
+	},
+	{
+		"case ab in a*) echo one ;& *zz) echo two ;; esac",
+		"one\ntwo\n",
+	},
+	{
+		"case ab in a*) echo one ;& *zz) echo two ;& *) echo three ;; esac",
+		"one\ntwo\nthree\n",
+	},
+	{
+		"f() { case ab in a*) echo one; return ;& *) echo two ;; esac; }; f; echo end",
+		"one\nend\n",
+	},
+	{
 		`touch a b; x=']'; echo [ab$x`,
 		"a b\n",
 	},
@@ -1394,6 +1599,82 @@ var runTests = []runTest{
 	{"return", "return: can only be done from a func or sourced script\nexit status 1 #JUSTERR"},
 	{"f() { return; }; f", ""},
 	{"f() { return 2; }; f", "exit status 2"},
+	{
+		"f() { f; }; f; echo unreachable",
+		"f: maximum nesting level exceeded (1000) #IGNORE bash has no limit by default",
+	},
+	{
+		"echo 'source ./a' >a; source ./a; echo unreachable",
+		"source: maximum nesting level exceeded (1000) #IGNORE bash has no limit by default",
+	},
+	{
+		`x='eval "$x"'; eval "$x"; echo unreachable`,
+		"eval: maximum nesting level exceeded (1000) #IGNORE bash has no limit by default",
+	},
+	{
+		`f() { if (($1 > 0)); then eval "f $(($1 - 1))"; fi; }; f 900; echo done`,
+		"done\n",
+	},
+	{
+		`o='{ ' c='}; '; for i in {1..10}; do o=$o$o c=$c$c; done; eval "f() { $o f; $c }"; f; echo unreachable`,
+		"statement nesting is deeper than 10000 levels #IGNORE bash has no limit by default",
+	},
+	{
+		`o='(' c=')'; for i in {1..12}; do o=$o$o c=$c$c; done; eval "f() { echo \$(( $o\$(f)$c )); }"; f 2>err; read -r l <err; echo "$l"`,
+		"statement nesting is deeper than 10000 levels\n #IGNORE bash has no limit by default",
+	},
+	{
+		`o='${x:-' c='}'; for i in {1..13}; do o=$o$o c=$c$c; done; eval "f() { echo \"$o\$(f)$c\"; }"; f 2>err; read -r l <err; echo "$l"`,
+		"statement nesting is deeper than 10000 levels\n #IGNORE bash has no limit by default",
+	},
+	{
+		`o='! '; for i in {1..13}; do o=$o$o; done; eval "f() { [[ $o\$(f) ]]; }"; f 2>err; read -r l <err; echo "$l"`,
+		"statement nesting is deeper than 10000 levels\n #IGNORE bash has no limit by default",
+	},
+	{
+		`o='${x:-' c='}'; for i in {1..13}; do o=$o$o c=$c$c; done; eval "f() { echo \"$o\$(<\"\$(f)\")$c\"; }"; f 2>err; read -r l <err; echo "$l"`,
+		"statement nesting is deeper than 10000 levels\n #IGNORE bash has no limit by default",
+	},
+	{
+		`o={ c=,c}; for i in {1..13}; do o=$o$o c=$c$c; done; eval "f() { echo $o{a,b\$(f)}$c; }"; f 2>err; read -r l <err; echo "$l"`,
+		"statement nesting is deeper than 10000 levels\n #IGNORE bash has no limit by default",
+	},
+	{
+		`f() { if (($1 > 0)); then echo $(( $(f $(($1 - 1))) + 1 )); else echo 0; fi; }; f 200`,
+		"200\n",
+	},
+	{
+		`set -- '!'; for i in {1..14}; do set -- "$@" "$@"; done; test "$@" x`,
+		"1:58: nesting is deeper than 10000 levels\nexit status 2 #IGNORE bash has no limit",
+	},
+	{
+		`set -- x -a; for i in {1..13}; do set -- "$@" "$@"; done; [ "$@" x ]`,
+		"1:59: nesting is deeper than 10000 levels\nexit status 2 #IGNORE bash crashes",
+	},
+	{
+		`set -- '('; for i in {1..14}; do set -- "$@" "$@"; done; test "$@" x`,
+		"1:58: nesting is deeper than 10000 levels\nexit status 2 #IGNORE bash has no limit",
+	},
+	{
+		`set -- '!' '!'; for i in {1..10}; do set -- "$@" "$@"; done; test "$@" x -a x -o '' && echo ok`,
+		"ok\n",
+	},
+	{
+		`set -- builtin; for i in {1..17}; do set -- "$@" "$@"; done; "$@" echo chained`,
+		"chained\n",
+	},
+	{
+		`set -- command; for i in {1..17}; do set -- "$@" "$@"; done; "$@" echo chained`,
+		"chained\n",
+	},
+	{
+		`e='elif false; then :; '; for i in {1..11}; do e=$e$e; done; eval "if false; then :; $e elif true; then echo last; fi"; eval "if false; then :; $e else echo else; fi"`,
+		"last\nelse\n",
+	},
+	{
+		`o='{ ' c='}; '; for i in {1..11}; do o=$o$o c=$c$c; done; eval "$o echo nested; $c"`,
+		"nested\n",
+	},
 	{"f() { echo foo; return; echo bar; }; f", "foo\n"},
 	{"f1() { :; }; f2() { f1; return; }; f2", ""},
 	{"echo 'return' >a; source ./a", ""},
@@ -1490,6 +1771,22 @@ var runTests = []runTest{
 
 	// redirects
 	{
+		"echo foo >&5",
+		"unhandled >& arg: \"5\"\nexit status 1 #JUSTERR",
+	},
+	{
+		"echo foo 5>a",
+		"unsupported redirect fd: 5\nexit status 1 #IGNORE",
+	},
+	{
+		"echo foo >|a",
+		"unhandled redirect op: >|\nexit status 1 #IGNORE",
+	},
+	{
+		"echo foo >a; read -r line <>a",
+		"unhandled redirect op: <>\nexit status 1 #IGNORE",
+	},
+	{
 		"echo foo >&1 | sed 's/o/a/g'",
 		"faa\n",
 	},
@@ -1563,12 +1860,102 @@ var runTests = []runTest{
 		"foo\n\n",
 	},
 	{
+		"cat <<-EOF\n\n\tfoo\nEOF",
+		"\nfoo\n",
+	},
+	{
+		"x=v; cat <<-EOF\n$x\tfoo\n\t$x\t\tbar\nEOF",
+		"v\tfoo\nv\t\tbar\n",
+	},
+	{
+		"cat <<-EOF\nfoo\\\n\tbar\nEOF",
+		"foo\tbar\n",
+	},
+	{
 		"cat <<EOF\nfoo\\\nbar\nEOF",
 		"foobar\n",
 	},
 	{
 		"cat <<'EOF'\nfoo\\\nbar\nEOF",
 		"foo\\\nbar\n",
+	},
+	{
+		"cat <<'EOF'\nback\\\\slash dollar\\$x tick\\`y\nEOF",
+		"back\\\\slash dollar\\$x tick\\`y\n",
+	},
+	{
+		"cat <<-'EOF'\n\ttab\\$stripped\n\tEOF",
+		"tab\\$stripped\n",
+	},
+	{
+		"cat <<\\EOF\ndollar\\$x\nEOF",
+		"dollar\\$x\n",
+	},
+	{
+		"cat <<'EOF'\n$HOME `echo hi` $(echo hi) $((1+1))\nEOF",
+		"$HOME `echo hi` $(echo hi) $((1+1))\n",
+	},
+	{
+		"cat <<\"EOF\"\ndollar\\$x\nEOF",
+		"dollar\\$x\n",
+	},
+	{
+		"cat <<EOF\nEOF",
+		"",
+	},
+	{
+		"cat <<'EOF'\nEOF",
+		"",
+	},
+	{
+		"cat <<-EOF\n\tEOF",
+		"",
+	},
+	// Bash ends a heredoc at EOF or a closing backquote, warning on stderr,
+	// and adds a newline to its last line if it lacks one.
+	{
+		"exec 2>/dev/null\ncat <<EOF",
+		"",
+	},
+	{
+		"exec 2>/dev/null\ncat <<EOF\nfoo\n",
+		"foo\n",
+	},
+	{
+		"exec 2>/dev/null\ncat <<EOF\nfoo",
+		"foo\n",
+	},
+	{
+		"exec 2>/dev/null\ncat <<EOF\nfoo $((1+2))",
+		"foo 3\n",
+	},
+	{
+		"exec 2>/dev/null\ncat <<'EOF'\nfoo\\",
+		"foo\\\n",
+	},
+	{
+		"exec 2>/dev/null\ncat <<-EOF\n\tfoo\n\tbar",
+		"foo\nbar\n",
+	},
+	{
+		"exec 2>/dev/null\ncat <<-EOF\n\tfoo\n\t",
+		"foo\n\n",
+	},
+	{
+		"exec 2>/dev/null\nx=v; cat <<-EOF\n$x\t",
+		"v\t\n",
+	},
+	{
+		"exec 2>/dev/null\ncat <<EOF 2>/dev/null || cat <<EOF\nfoo\nEOF",
+		"foo\n",
+	},
+	{
+		"exec 2>/dev/null\necho \"`cat <<EOF; echo bar\nfoo`\"",
+		"foo\nbar\n",
+	},
+	{
+		"exec 2>/dev/null\nx=`cat <<EOF`\necho \"[$x]\"",
+		"[]\n",
 	},
 	{
 		"cat <<EOF\nfoo\\\"bar\\baz\nEOF",
@@ -1579,7 +1966,8 @@ var runTests = []runTest{
 		" \\ $ ` \n",
 	},
 	{
-		"mkdir a; echo foo >a |& grep -q 'is a directory'",
+		// The error message is capitalized on some platforms, such as js.
+		"mkdir a; echo foo >a |& grep -q -i 'is a directory'",
 		" #IGNORE bash prints a warning",
 	},
 	{
@@ -1656,6 +2044,9 @@ var runTests = []runTest{
 	{"echo foo | true | false & wait $!", "exit status 1"},
 	{"echo foo | false | true & wait $!", ""},
 	{"f() { false & true; }; f; wait $!", "exit status 1"},
+	// $! stays a fake PID here because runTests installs exec middleware;
+	// TestBackgroundRealPID covers the default exec handler.
+	{"sleep 0.01 & case $! in g*) echo fake ;; *) echo real ;; esac; wait", "fake\n #IGNORE bash uses real PIDs"},
 	// The parent and child shells should not cause data races when setting env vars.
 	// Note that we can't use `echo $var`, as it seems to write newlines separately,
 	// which can cause them to get mixed up between concurrent subshells.
@@ -2529,6 +2920,14 @@ var runTests = []runTest{
 		"foo: bar\nexit status 1 #JUSTERR",
 	},
 	{
+		`set -u; declare -a a; declare -A m; f() { local -a l; echo "${l[@]}" ok; }; echo "${a[@]}" "${m[@]}" ok; f`,
+		"ok\nok\n",
+	},
+	{
+		`declare -a a; printf '<%s>' "${a[@]:-x}" "${nope[@]-y}"; echo`,
+		"<x><y>\n",
+	},
+	{
 		"set -ue; set -ueo pipefail",
 		"",
 	},
@@ -2555,6 +2954,10 @@ set +o pipefail
  #IGNORE`,
 	},
 	{`set - foobar; echo $@; set -; echo $@`, "foobar\nfoobar\n"},
+	{
+		"set -x; set -; echo hi",
+		"+ set -\nhi\n",
+	},
 
 	// unset
 	{
@@ -2689,6 +3092,23 @@ done <<< 2`,
 		"shopt -o -s nosuchname",
 		"shopt: invalid option name \"nosuchname\"\nexit status 1 #JUSTERR",
 	},
+	// shopt -q queries option states without printing
+	{
+		"shopt -s nullglob; shopt -q nullglob; echo q=$?; shopt -u nullglob; shopt -q nullglob; echo q=$?",
+		"q=0\nq=1\n",
+	},
+	{
+		"shopt -s nullglob globstar; shopt -q nullglob globstar; echo q=$?; shopt -u nullglob; shopt -q nullglob globstar; echo q=$?",
+		"q=0\nq=1\n",
+	},
+	{
+		"shopt -q nosuchname",
+		"shopt: invalid option name \"nosuchname\"\nexit status 1 #JUSTERR",
+	},
+	{
+		"shopt -q; echo q=$?",
+		"q=0\n",
+	},
 	{
 		"touch a .b ..c; shopt -u dotglob; echo *",
 		"a\n",
@@ -2704,6 +3124,10 @@ done <<< 2`,
 	{
 		"mkdir sub .sub2; touch {sub,.sub2}/{a,.b}; shopt -s globstar; shopt -s dotglob; echo **/* | sed 's@\\\\@/@g'",
 		".sub2 .sub2/.b .sub2/a sub sub/.b sub/a\n",
+	},
+	{
+		"touch a.go b.go; echo \\*.go \\[a].go a\\* 'a'\\*",
+		"*.go [a].go a* a*\n",
 	},
 	{
 		// Beware that macOS file systems are by default case-preserving but
@@ -2728,8 +3152,8 @@ done <<< 2`,
 		"shopt: unsupported option \"-p\"\nexit status 2 #IGNORE",
 	},
 	{
-		"shopt -q",
-		"shopt: unsupported option \"-q\"\nexit status 2 #IGNORE",
+		"shopt -q; echo q=$?",
+		"q=0\n",
 	},
 
 	// IFS
@@ -2755,6 +3179,11 @@ done <<< 2`,
 	{`a=(zo wo); IFS=-; b=${a[*]^}; echo "$b"`, "Zo-Wo\n"},
 	{`a=(x y z); IFS=-; echo "${!a[*]}"`, "0-1-2\n"},
 	{`INTERP_Y_1=a INTERP_Y_2=b; IFS=-; echo "${!INTERP_Y_*}"`, "INTERP_Y_1-INTERP_Y_2\n"},
+	{`unset IFS; set -- x y; echo "${IFS=-}$*" "$*"`, "-x-y x-y\n"},
+	{`unset IFS; set -- x y; a="${IFS=-}${b:-$*}"; echo "$a"`, "-x-y\n"},
+	{`unset IFS; set -- x y; a="${b:-${IFS=-}}$*"; echo "$a"`, "-x-y\n"},
+	{`set -- x y; echo "$((IFS=7))$*"`, "7x7y\n"},
+	{`set -- x y; echo "$((IFS[0]=7))$*"`, "7x y\n"},
 
 	// builtin
 	{"builtin", ""},
@@ -2925,6 +3354,34 @@ done <<< 2`,
 	{
 		"a=(1 2 3); echo ${a[2-1]}; echo $((a[1+1]))",
 		"2\n3\n",
+	},
+	{
+		"a=(1 2 3); ((a[1]++)); ((a[2]=9)); echo $((a[0]+=4)) ${a[@]}",
+		"5 5 3 9\n",
+	},
+	{
+		"a=(1 2 3); i=0; ((a[i++]+=5)); echo $i ${a[@]}",
+		"1 6 2 3\n",
+	},
+	{
+		"a=(1 2); ((a[0] = (a[1]=5))); ((a[-1]*=2)); echo ${a[@]}",
+		"5 10\n",
+	},
+	{
+		"a=(1 2); ((a++)); declare -p a",
+		"declare -a a=([0]=\"2\" [1]=\"2\")\n",
+	},
+	{
+		"s=7; ((s[0]+=1)); ((s[2]=4)); declare -p s",
+		"declare -a s=([0]=\"8\" [2]=\"4\")\n",
+	},
+	{
+		`declare -A m; ((m[k]+=2)); ((m[k]++)); ((m[foo-bar]=3)); echo ${m[k]} ${m["foo-bar"]}`,
+		"3 3\n",
+	},
+	{
+		"a=(1 2); ((a[*]++)); echo ${a[@]}",
+		"a[*]: bad array subscript\n1 2\n #JUSTERR",
 	},
 	{
 		"a=(1 2) x=(); a+=b x+=c; echo ${a[@]}; echo ${x[@]}",
@@ -3104,6 +3561,20 @@ done <<< 2`,
 	{"a=(x y); : \"${a[5]=z}\"; declare -p a", "declare -a a=([0]=\"x\" [1]=\"y\" [5]=\"z\")\n"},
 	{"s=x; : \"${s[1]=z}\"; declare -p s", "declare -a s=([0]=\"x\" [1]=\"z\")\n"},
 	{"declare -A m=([k]=v); : \"${m[j]=z}\"; echo ${m[j]} ${m[k]}", "z v\n"},
+	// unquoted keys which parse as arithmetic expressions
+	{`declare -A m; m[foo-bar]=1; m[a/b]=2; echo "${m["foo-bar"]}" "${m["a/b"]}"`, "1 2\n"},
+	{`declare -A m=([foo-bar]=x); echo "${m[foo-bar]}"`, "x\n"},
+	{`declare -A m; : "${m[x+1]=y}"; echo "${m["x+1"]}"`, "y\n"},
+	{`declare -A m; x=a; m[$x-1]=v; echo "${m["a-1"]}" "${m[$x-1]}"`, "v v\n"},
+	// key-value pairs without subscripts
+	{"declare -A m=(a 1 b 2); echo ${m[a]} ${m[b]}", "1 2\n"},
+	{"declare -A m=(a 1 b); echo ${m[a]} ${m[b]+set}", "1 set\n"},
+	{`v="p q"; declare -A m=($v "x y" z); echo "${m["p q"]}" ${m[z]+set}`, "x y set\n"},
+	{`declare -A m=(a 1 [x]=2 b 3); echo "${m["[x]=2"]}" ${m[3]+set}`, "b set\n"},
+	{
+		"declare -A m=([x]=1 a 1)",
+		"m: a: must use subscript when assigning associative array\nexit status 1 #JUSTERR",
+	},
 	{"a=([5]=b [-1]=c d); declare -p a", "declare -a a=([5]=\"c\" [6]=\"d\")\n"},
 	{"a=(1 2 3); echo ${a[-1]} ${a[-3]}", "3 1\n"},
 	{"a=(x); unset 'a[]'; echo $?; declare -p a", "0\ndeclare -a a=([0]=\"x\")\n"},
@@ -3142,6 +3613,11 @@ done <<< 2`,
 	{"foo() { export bar; }; bar=foo; foo; $ENV_PROG | grep ^bar=", "bar=foo\n"},
 	{"foo() { export bar; }; foo; bar=foo; $ENV_PROG | grep ^bar=", "bar=foo\n"},
 	{"foo() { export bar=foo; }; foo; readonly bar; $ENV_PROG | grep ^bar=", "bar=foo\n"},
+	{"export foo=0; for foo in a; do :; done; $ENV_PROG | grep '^foo='", "foo=a\n"},
+	{"export foo=0; read foo <<< a; $ENV_PROG | grep '^foo='", "foo=a\n"},
+	{"export foo=0; getopts a foo -a; $ENV_PROG | grep '^foo='", "foo=a\n"},
+	{"export foo=0; : $((foo=1)); $ENV_PROG | grep '^foo='", "foo=1\n"},
+	{"export foo; : ${foo:=a}; $ENV_PROG | grep '^foo='", "foo=a\n"},
 
 	// local
 	{
@@ -3195,6 +3671,54 @@ done <<< 2`,
 	{
 		`export x=before; f() { local x; export x=after; $ENV_PROG | grep '^x='; }; f; echo $x`,
 		"x=after\nbefore\n",
+	},
+	{
+		`foo=x; f() { local foo; echo "${foo+set}|${foo-unset}"; declare -p foo; }; f; declare -p foo`,
+		"|unset\ndeclare -- foo\ndeclare -- foo=\"x\"\n",
+	},
+	{
+		`export foo=x; f() { local foo; declare -p foo; $ENV_PROG >env.txt; grep '^foo=' <env.txt; foo=y; $ENV_PROG | grep '^foo='; }; f; declare -p foo`,
+		"declare -x foo\nfoo=x\nfoo=y\ndeclare -x foo=\"x\"\n",
+	},
+	{
+		`readonly foo=x; f() { local foo 2>/dev/null; echo "$? ${foo+set}"; }; f`,
+		"1 set\n",
+	},
+	{
+		`foo=(a b); declare -A bar=([k]=v); f() { local foo bar; declare -p foo bar; }; f; declare -p foo`,
+		"declare -- foo\ndeclare -- bar\ndeclare -a foo=([0]=\"a\" [1]=\"b\")\n",
+	},
+	{
+		`foo=x; f() { declare foo; echo "${foo+set}|"; }; f; echo "$foo"`,
+		"|\nx\n",
+	},
+	{
+		`foo=x; bar=x; f() { local -a foo; local -A bar; declare -p foo bar; }; f`,
+		"declare -a foo\ndeclare -A bar\n",
+	},
+	{
+		`export foo=x; f() { local -a foo; declare -p foo; }; f`,
+		"declare -ax foo\n",
+	},
+	{
+		`foo=x; f() { local -x foo; declare -p foo; $ENV_PROG | grep -q '^foo=' || echo none; }; f`,
+		"declare -x foo\nnone\n",
+	},
+	{
+		`foo=x; f() { local -r foo; declare -p foo; }; f`,
+		"declare -r foo\n",
+	},
+	{
+		`foo=x; f() { local foo=y; local foo; echo "$foo"; }; f`,
+		"y\n",
+	},
+	{
+		`f() { local -x foo=a; g; }; g() { local foo; echo "${foo-unset}"; $ENV_PROG >env.txt; grep '^foo=' <env.txt; }; f`,
+		"unset\nfoo=a\n",
+	},
+	{
+		`export foo=x; f() { local foo; unset foo; $ENV_PROG >env.txt; grep '^foo=' <env.txt; }; f`,
+		"foo=x\n",
 	},
 	{
 		"getx() { echo $X; }; f() { local X=Y; getx; echo $X; }; f",
@@ -3412,6 +3936,10 @@ done <<< 2`,
 		"a a/b a/b/c a/d\n",
 	},
 	{
+		"shopt -s globstar; mkdir -p a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a; touch a/x; echo **/**/**/**/**/**/**/**/**/**/**/**/x **//**///**//**//**//**//**//**//**//**//**//x | sed 's@\\\\@/@g'; set -- a/a/a/a/**/**/; echo $#",
+		"a/x a/x\n17\n",
+	},
+	{
 		"shopt -s globstar; mkdir -p a.x a/b.x a/b/c.x; echo **.x ./**.x | sed 's@\\\\@/@g'",
 		"a.x ./a.x\n",
 	},
@@ -3510,28 +4038,49 @@ done <<< 2`,
 	// Unsupported: multiple groups, glob prefix, or glob suffix.
 	{
 		"shopt -s extglob\ncase \"xabab\" in *a!(b)) echo match;; esac",
-		" #IGNORE glob prefix not supported",
+		"extglob !(...) is only supported with a fixed prefix and suffix\n #IGNORE glob prefix not supported",
 	},
 	{
 		"shopt -s extglob\ncase \"baz\" in !(foo)!(bar)) echo match;; esac",
-		" #IGNORE multiple extglob negation groups not supported",
+		"multiple extglob !(...) groups are not supported yet\n #IGNORE multiple extglob negation groups not supported",
 	},
 	{
 		"shopt -s extglob\ncase \".bar\" in .*!(foo)) echo match;; esac",
-		" #IGNORE glob prefix not supported",
+		"extglob !(...) is only supported with a fixed prefix and suffix\n #IGNORE glob prefix not supported",
 	},
 	{
 		"shopt -s extglob\ncase \".foo\" in .*!(foo)) echo match;; esac",
-		" #IGNORE glob prefix not supported",
+		"extglob !(...) is only supported with a fixed prefix and suffix\n #IGNORE glob prefix not supported",
 	},
 	{
 		"shopt -s extglob\ncase \"bar\" in .*!(foo)) echo match;; esac",
-		" #IGNORE glob prefix not supported",
+		"extglob !(...) is only supported with a fixed prefix and suffix\n #IGNORE glob prefix not supported",
 	},
 	{
 		// Extended pattern matching is always available outside of pathname expansions (globbing).
 		"[[ a123z == a@([0-9])z ]]; echo $?; [[ a123z == a+([0-9])z ]]; echo $?",
 		"1\n0\n",
+	},
+	{
+		// An unclosed extended pattern group is literal text, like in Bash.
+		"p='@(a'; case '@(a' in $p) echo lit;; esac; [[ a == $p ]]; echo $?",
+		"lit\n1\n",
+	},
+	{
+		`p='@(' q=')'; for i in {1..11}; do p=$p$p q=$q$q; done; [[ x == $p$q ]]; echo $?`,
+		"1\n",
+	},
+	{
+		`p='@(a|'; for i in {1..9}; do p=$p$p; done; case $p in $p) echo lit;; esac; [[ x == $p ]]; echo $?`,
+		"lit\n1\n",
+	},
+	{
+		`p='['; for i in {1..15}; do p=$p$p; done; case $p in $p) echo lit;; esac; [[ x == $p ]]; echo $?`,
+		"lit\n1\n",
+	},
+	{
+		`x=a p='*'; for i in {1..13}; do x=$x$x p=$p$p; done; y=${x##${p}b} z=${x//${p}b/c} u=${x^^$p}; echo ${#y} ${#z} ${#u}; [[ $x == ${p}b ]]; echo $?`,
+		"8192 8192 8192\n1\n",
 	},
 	// Ensure that setting nullglob does not return invalid globs as null
 	// strings.
@@ -3615,7 +4164,23 @@ done <<< 2`,
 	},
 	{
 		"echo a{0..9999999999}b",
-		"brace expansion would exceed 16384 elements\n #JUSTERR bash errors with a different message",
+		"brace expansion would exceed 16384 elements\n #IGNORE bash limits sequence bounds to a C long, so 32-bit bash leaves this literal",
+	},
+	{
+		"echo {9223372036854775806..9223372036854775807} {-9223372036854775807..-9223372036854775808} {1..10..9223372036854775807} {a..z..9223372036854775807}",
+		"9223372036854775806 9223372036854775807 -9223372036854775807 -9223372036854775808 1 a\n",
+	},
+	{
+		`o={ c=,c}; for i in {1..10}; do o=$o$o c=$c$c; done; eval "set -- $o{a,b}$c"; echo $#`,
+		"1026\n",
+	},
+	{
+		`o={ c=,c}; for i in {1..14}; do o=$o$o c=$c$c; done; eval ": $o{a,b}$c"`,
+		"brace expansion is deeper than 10000 levels\n #IGNORE bash has no limit",
+	},
+	{
+		`b={a,b}; for i in {1..14}; do b=$b$b; done; eval ": $b"`,
+		"brace expansion is deeper than 10000 levels\n #IGNORE bash has no limit",
 	},
 
 	// brace expansion in declarations
@@ -3821,6 +4386,16 @@ done <<< 2`,
 		"Prompt and raw flag together: \\a\\b\\c\n #IGNORE bash requires a terminal",
 	},
 
+	// read -s
+	{
+		"read -r -s x <<< hi; echo \"[$x]\"",
+		"[hi]\n",
+	},
+	{
+		"printf 'a b\\n' | { read -s -r a b; echo \"[$a][$b]\"; }",
+		"[a][b]\n",
+	},
+
 	// read -a
 	{
 		`echo "1 2 3" | { read -a arr; echo "${arr[0]} ${arr[1]} ${arr[2]}"; }`,
@@ -3928,6 +4503,10 @@ done <<< 2`,
 		"a() { while getopts abc: opt; do echo $opt $OPTARG; done }; a -a -b -c arg",
 		"a\nb\nc arg\n",
 	},
+	{
+		"set -- -abc; getopts abc opt; set -- -a; getopts abc opt; echo $opt $OPTIND",
+		"a 2\n",
+	},
 	// mapfile
 	{
 		"mapfile <<EOF\na\nb\nc\nEOF\n" + `for x in "${MAPFILE[@]}"; do echo "$x"; done`,
@@ -3948,7 +4527,16 @@ done <<< 2`,
 }
 
 var runTestsUnix = []runTest{
+	{
+		// Like Bash, globstar does not walk symbolic links, which may form loops.
+		"shopt -s globstar; mkdir -p d/e; touch d/e/f; ln -s d l; ln -s . x; ln -s . y; echo **; echo **/; echo **//; echo **/f; echo */**/f",
+		"d d/e d/e/f l x y\nd/ d/e/ l/ x/ y/\nd/ d/e/ l/ x/ y/\nd/e/f\nd/e/f l/e/f x/d/e/f y/d/e/f\n",
+	},
 	{"[[ -n $PPID && $PPID -ge 0 ]]", ""}, // can be 0 if running as the init process
+	{`$ENV_PROG | grep -q "^PWD=$PWD\$"`, ""},
+	{`mkdir a; cd a; $ENV_PROG | grep -q "^PWD=$PWD\$"`, ""},
+	{`export OLDPWD; mkdir a; cd a; $ENV_PROG | grep -q "^OLDPWD=$OLDPWD\$"`, ""},
+	{`unset OLDPWD; mkdir a; cd a; $ENV_PROG | grep -q "^OLDPWD="`, "exit status 1"},
 	{
 		// no root user on windows
 		"[[ ~root == '~root' ]]",
@@ -4178,7 +4766,35 @@ var runTestsUnix = []runTest{
 		"test -e <(echo foo)",
 		"",
 	},
+	{
+		"for i in {1..200}; do : <(:) >(:); done; wait; echo done",
+		"done\n",
+	},
+	{
+		"f() { cat $1; }; f <(echo foo)",
+		"foo\n",
+	},
+	{
+		`f() { { sleep 0.1; cat "$1"; } & }; f <(echo foo); wait`,
+		"foo\n",
+	},
+	{
+		`f() { : <(sleep 0.1; cat "$1" >&2); }; f <(echo foo); wait`,
+		"foo\n",
+	},
+	{
+		`f() { { sleep 0.1; : & wait; cat "$1"; } & }; f <(echo foo); wait`,
+		"foo\n",
+	},
+	{
+		"for f in <(echo foo) <(echo bar); do cat $f; done",
+		"foo\nbar\n",
+	},
 	// echo trace
+	{
+		`printf 'a\0b' | { read -r x; set -x; : "$x"; }`,
+		"+ : ab\n",
+	},
 	{
 		`set -x; animals=("dog", "cat", "otter"); echo "hello ${animals[*]}"`,
 		`+ animals=("dog", "cat", "otter")
@@ -4273,6 +4889,29 @@ hello otter
 `,
 	},
 	{
+		"set -x; set -e; echo hi",
+		"+ set -e\n+ echo hi\nhi\n",
+	},
+	{
+		"set -x; set +x; echo hi",
+		"+ set +x\nhi\n",
+	},
+	{
+		// TODO: bash prints `a[1]=z`, including the subscript.
+		`set -x; a=(x y); a[1]=z`,
+		"+ a=(x y)\n+ a=z\n #IGNORE",
+	},
+	{
+		// TODO: bash prints `a+=bar`, that is, the value being appended
+		// rather than the resulting value.
+		`set -x; a=foo; a+=bar`,
+		"+ a=foo\n+ a=foobar\n #IGNORE",
+	},
+	{
+		`set -x; a=(x); a+=(y)`,
+		"+ a=(x)\n+ a+=(y)\n",
+	},
+	{
 		`set -x; a=x"y"$z b=(foo bar $none '')`,
 		"+ a=xy\n+ b=(foo bar $none '')\n",
 	},
@@ -4344,6 +4983,15 @@ let a++; echo $a`,
 + echo 10
 10
 `,
+	},
+	{
+		`set -x; let a=1 b=2`,
+		"+ let a=1 b=2\n",
+	},
+	{
+		// Note that bash cannot parse `let (a=3)` at all.
+		`set -x; let (a=3)`,
+		"+ let (a = 3)\n #IGNORE",
 	},
 	// functions
 	{
@@ -4425,9 +5073,13 @@ var runTests64bit = []runTest{
 }
 
 func init() {
-	if runtime.GOOS == "windows" {
+	switch {
+	case runtime.GOOS == "windows":
 		runTests = append(runTests, runTestsWindows...)
-	} else { // Unix-y
+	case runtime.GOOS == "js":
+		// Neither Unix-y nor Windows: js/wasm has no subprocesses,
+		// and its file modes and syscall errors differ from Unix.
+	default: // Unix-y
 		runTests = append(runTests, runTestsUnix...)
 	}
 	if bits.UintSize == 64 {
@@ -4442,12 +5094,23 @@ var skipOnWindows = regexp.MustCompile(`ln -s|<\(`)
 // process substitutions seemflaky on mac; see https://github.com/mvdan/sh/issues/576
 var skipOnMac = regexp.MustCompile(`>\(|<\(`)
 
+// canExec reports whether the platform can run external programs.
+// js/wasm has no subprocesses at all.
+const canExec = runtime.GOOS != "js"
+
+// Without subprocesses we can't run the test binary as a helper program,
+// nor any external program, nor create the named pipes used by process
+// substitutions.
+var skipWithoutExec = regexp.MustCompile(`GOSH_PROG|ENV_PROG|PATH_PROG|>\(|<\(`)
+
 func skipIfUnsupported(tb testing.TB, src string) {
 	switch {
 	case runtime.GOOS == "windows" && skipOnWindows.MatchString(src):
 		tb.Skipf("skipping non-portable test on windows")
 	case runtime.GOOS == "darwin" && skipOnMac.MatchString(src):
 		tb.Skipf("skipping non-portable test on mac")
+	case !canExec && skipWithoutExec.MatchString(src):
+		tb.Skipf("skipping test needing subprocesses on %s", runtime.GOOS)
 	}
 }
 
@@ -4564,7 +5227,8 @@ func absPath(dir, path string) string {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(dir, path)
 	}
-	return filepath.Clean(path) // TODO: this clean is likely unnecessary
+	// Keep in sync with interp's own absPath, which explains the cleaning.
+	return filepath.Clean(path)
 }
 
 var testBuiltinsMap = map[string]func(interp.HandlerContext, []string) error{
@@ -4830,6 +5494,12 @@ func TestRunnerRunConfirm(t *testing.T) {
 		// case-sensitive, which isn't how Windows works.
 		t.Skip("bash on Windows emulates Unix-y behavior")
 	}
+	if runtime.GOOS == "darwin" {
+		// Homebrew's bash uses a shared readline whose tilde expansion
+		// ignores HOME assignments, and macOS's stdio retains output
+		// which failed to write to closed file descriptors.
+		t.Skip("bash on macOS diverges from bash on Linux")
+	}
 	for _, c := range runTests {
 		t.Run("", func(t *testing.T) {
 			if strings.Contains(c.want, " #IGNORE") {
@@ -4958,6 +5628,41 @@ func TestRunnerOpts(t *testing.T) {
 			"bar\n",
 		},
 		{
+			opts(interp.Params("-o"), interp.Params("+o")),
+			"echo foo",
+			"foo\n",
+		},
+		{
+			opts(interp.BashOpts()),
+			"echo foo",
+			"foo\n",
+		},
+		{
+			opts(interp.BashOpts("-s", "expand_aliases")),
+			"alias f='echo x'\nf",
+			"x\n",
+		},
+		{
+			opts(interp.BashOpts("-s", "extglob", "nullglob")),
+			"[[ abc == @(abc|def) ]] && echo yes\necho no-match-*",
+			"yes\n\n",
+		},
+		{
+			opts(interp.BashOpts("-s", "globstar"), interp.BashOpts("-u", "globstar")),
+			"shopt globstar | grep -q 'off$'",
+			"",
+		},
+		{
+			opts(interp.BashOpts("-o", "-s", "pipefail")),
+			"false | true; echo $?",
+			"1\n",
+		},
+		{
+			opts(interp.BashOpts("-o", "-s", "noglob")),
+			"echo *",
+			"*\n",
+		},
+		{
 			opts(interp.Env(expand.FuncEnviron(func(name string) string {
 				if name == "foo" {
 					return "bar"
@@ -4989,6 +5694,62 @@ func TestRunnerOpts(t *testing.T) {
 			if got := cb.String(); got != c.want {
 				t.Fatalf("wrong output in %q:\nwant: %q\ngot:  %q",
 					c.in, c.want, got)
+			}
+		})
+	}
+}
+
+func TestRunnerBashOpts(t *testing.T) {
+	t.Parallel()
+
+	// Applying the option to an existing runner takes effect right away,
+	// including for the options which affect expansion.
+	file := parse(t, nil, "echo no-match-*")
+	var b bytes.Buffer
+	r, err := interp.New(interp.StdIO(nil, &b, &b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), runnerRunTimeout)
+	defer cancel()
+	if err := r.Run(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	if err := interp.BashOpts("-s", "nullglob")(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	want := "no-match-*\n\n"
+	if got := b.String(); got != want {
+		t.Fatalf("\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+func TestRunnerBashOptsErr(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"-z"}, `invalid option: "-z"`},
+		{[]string{"-p"}, `invalid option: "-p"`},
+		{[]string{"-o", "-s", "extglob"}, `invalid option name: "extglob"`},
+		{[]string{"-s", "pipefail"}, `invalid option name: "pipefail"`},
+		{[]string{"extglob"}, "either -s or -u must be given to set or unset options"},
+		{[]string{"-s", "nosuchname"}, `invalid option name: "nosuchname"`},
+		{[]string{"-s", "login_shell"}, `unsupported option: "login_shell"`},
+	}
+	for _, test := range tests {
+		t.Run("", func(t *testing.T) {
+			_, err := interp.New(interp.BashOpts(test.args...))
+			if err == nil {
+				t.Fatalf("BashOpts(%q) did not error", test.args)
+			}
+			if got := err.Error(); got != test.want {
+				t.Fatalf("BashOpts(%q):\nwant: %q\ngot:  %q", test.args, test.want, got)
 			}
 		})
 	}
@@ -5034,6 +5795,13 @@ func TestRunnerContext(t *testing.T) {
 }
 
 func TestCancelBlockedStdinRead(t *testing.T) {
+	// "read -s" reads without echoing, which must still be cancellable.
+	for _, in := range []string{"read x", "read -s x"} {
+		t.Run("", func(t *testing.T) { testCancelBlockedStdinRead(t, in) })
+	}
+}
+
+func testCancelBlockedStdinRead(t *testing.T, in string) {
 	if runtime.GOOS == "windows" {
 		// TODO: Why is this? The [os.File.SetReadDeadline] docs seem to imply that it should work
 		// across all major platforms, and the file polling  implementation seems to be
@@ -5042,10 +5810,13 @@ func TestCancelBlockedStdinRead(t *testing.T) {
 		// on Windows either, so skipping here is not any worse.
 		t.Skip("os.Pipe on windows appears to not support cancellable reads")
 	}
+	if runtime.GOOS == "js" {
+		t.Skip("js/wasm has no os.Pipe, and its reads can't be cancelled")
+	}
 	t.Parallel()
 
 	p := syntax.NewParser()
-	file := parse(t, p, "read x")
+	file := parse(t, p, in)
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	// Make the linter happy, even though we deliberately wait for the timeout.
 	defer cancel()
@@ -5207,7 +5978,7 @@ func TestRunnerIncremental(t *testing.T) {
 	defer cancel()
 	for _, stmt := range file.Stmts {
 		err := r.Run(ctx, stmt)
-		if !errors.As(err, new(interp.ExitStatus)) && err != nil {
+		if _, ok := errors.AsType[interp.ExitStatus](err); !ok && err != nil {
 			// Keep track of unexpected errors.
 			b.WriteString(err.Error())
 		}
@@ -5232,7 +6003,9 @@ func TestRunnerIncrementalExitTrap(t *testing.T) {
 	var exit interp.ExitStatus
 	for _, stmt := range file.Stmts {
 		err := r.Run(ctx, stmt)
-		if err != nil && !errors.As(err, &exit) {
+		if es, ok := errors.AsType[interp.ExitStatus](err); ok {
+			exit = es
+		} else if err != nil {
 			b.WriteString(err.Error())
 		}
 		if r.Exited() {
@@ -5245,6 +6018,75 @@ func TestRunnerIncrementalExitTrap(t *testing.T) {
 	if got := b.String(); got != want {
 		t.Fatalf("\nwant: %q\ngot:  %q", want, got)
 	}
+}
+
+// countOpen wraps [interp.DefaultOpenHandler] to count the files still open.
+func countOpen(open *atomic.Int64) interp.OpenHandlerFunc {
+	return func(ctx context.Context, path string, flags int, mode os.FileMode) (io.ReadWriteCloser, error) {
+		f, err := interp.DefaultOpenHandler()(ctx, path, flags, mode)
+		if err != nil {
+			return nil, err
+		}
+		open.Add(1)
+		return &countedFile{ReadWriteCloser: f, open: open}, nil
+	}
+}
+
+type countedFile struct {
+	io.ReadWriteCloser
+	open *atomic.Int64
+}
+
+func (f *countedFile) Close() error {
+	f.open.Add(-1)
+	return f.ReadWriteCloser.Close()
+}
+
+func TestRunnerCloseKeptFiles(t *testing.T) {
+	t.Parallel()
+
+	// The files kept open by exec must be closed once the shell exits,
+	// which is implied by running an entire file, or the subshell exits.
+	tests := []string{
+		"exec >a; echo foo",
+		"exec >a 2>b <a; exec >c",
+		"f() { exec >a; }; f",
+		"exec >a; exit 3",
+		"(exec >a; echo foo)",
+		"{ exec >a; echo foo; } | read x",
+		"x=$(exec >a; echo foo)",
+		"read x < <(exec >a; echo foo)",
+		"exec >a & wait",
+	}
+	for _, src := range tests {
+		t.Run("", func(t *testing.T) {
+			skipIfUnsupported(t, src)
+			t.Parallel()
+			file := parse(t, nil, src)
+			var open atomic.Int64
+			r, _ := interp.New(interp.Dir(t.TempDir()), interp.OpenHandler(countOpen(&open)))
+			ctx, cancel := context.WithTimeout(t.Context(), runnerRunTimeout)
+			defer cancel()
+			r.Run(ctx, file)
+			qt.Assert(t, qt.Equals(open.Load(), 0), qt.Commentf("input: %q", src))
+		})
+	}
+
+	// Running statements incrementally keeps the files open until Reset.
+	t.Run("Incremental", func(t *testing.T) {
+		t.Parallel()
+		file := parse(t, nil, "exec >a; echo foo")
+		var open atomic.Int64
+		r, _ := interp.New(interp.Dir(t.TempDir()), interp.OpenHandler(countOpen(&open)))
+		ctx, cancel := context.WithTimeout(t.Context(), runnerRunTimeout)
+		defer cancel()
+		for _, stmt := range file.Stmts {
+			qt.Assert(t, qt.IsNil(r.Run(ctx, stmt)))
+		}
+		qt.Assert(t, qt.Equals(open.Load(), 1))
+		r.Reset()
+		qt.Assert(t, qt.Equals(open.Load(), 0))
+	})
 }
 
 func TestRunnerResetFields(t *testing.T) {
@@ -5492,6 +6334,8 @@ func TestRunnerSubshell(t *testing.T) {
 }
 
 func TestRunnerNonFileStdin(t *testing.T) {
+	const src = "while read a; do echo $a; GOSH_CMD=print_ok $GOSH_PROG; done"
+	skipIfUnsupported(t, src)
 	t.Parallel()
 
 	var cb concBuffer
@@ -5499,7 +6343,7 @@ func TestRunnerNonFileStdin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	file := parse(t, nil, "while read a; do echo $a; GOSH_CMD=print_ok $GOSH_PROG; done")
+	file := parse(t, nil, src)
 	ctx, cancel := context.WithTimeout(t.Context(), runnerRunTimeout)
 	defer cancel()
 	if err := r.Run(ctx, file); err != nil {

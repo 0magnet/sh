@@ -75,6 +75,25 @@ var printTests = []printCase{
 	// newline at the beginning of second chunk
 	{"a" + strings.Repeat(" ", bufSize-2) + "\nb", "a\nb"},
 	{"foo; bar", "foo\nbar"},
+	// Statement pairs ending in a control-flow command, such as exit
+	// guards, stay on a single line; see issues #564 and #679.
+	samePrint(`main "$@"; exit $?`),
+	samePrint("a=$1; shift"),
+	samePrint("foo; return $?"),
+	samePrint("foo; break"),
+	samePrint("foo; continue"),
+	samePrint("foo; ! exit 1"),
+	samePrint("foo & exit 1"),
+	samePrint("cat <<DOC; exit 1\nbody\nDOC"),
+	{"foo; exit 1; bar", "foo; exit 1\nbar"},
+	{"if a; then b; exit 1; fi", "if a; then\n\tb; exit 1\nfi"},
+	{"foo || { echo err; exit 1; }", "foo || {\n\techo err; exit 1\n}"},
+	{"case $1 in\n-v) x=1; break ;;\nesac", "case $1 in\n-v)\n\tx=1; break\n\t;;\nesac"},
+	// These must always be split or left alone.
+	{"exit 1; foo", "exit 1\nfoo"},
+	{`foo; "exit" 1`, "foo\n\"exit\" 1"},
+	{"foo; exit=1", "foo\nexit=1"},
+	samePrint("foo\nexit 1"),
 	{"foo\n\n\nbar", "foo\n\nbar"},
 	{"foo\n\n", "foo"},
 	{"\n\nfoo", "foo"},
@@ -297,12 +316,18 @@ var printTests = []printCase{
 	},
 	{
 		"if foo \\\nbar\nthen\nbar\nfi",
-		"if foo \\\n\tbar; then\n\tbar\nfi",
+		"if foo \\\n\tbar\nthen\n\tbar\nfi",
 	},
 	{
 		"if foo \\\n&& bar\nthen\nbar\nfi",
-		"if foo &&\n\tbar; then\n\tbar\nfi",
+		"if foo &&\n\tbar\nthen\n\tbar\nfi",
 	},
+	samePrint("if foo &&\n\tbar\nthen\n\tbar\nfi"),
+	samePrint("if foo &&\n\tbar; then\n\tbar\nfi"),
+	samePrint("if a; then\n\tb\nelif c &&\n\td\nthen\n\te\nfi"),
+	samePrint("while foo &&\n\tbar\ndo\n\tbar\ndone"),
+	samePrint("until foo &&\n\tbar\ndo\n\tbar\ndone"),
+	samePrint("for i in a b \\\n\tc\ndo\n\td\ndone"),
 	{
 		"a |\nb |\nc",
 		"a |\n\tb |\n\tc",
@@ -544,6 +569,13 @@ var printTests = []printCase{
 		"f <<-EOF\n\t{\n\t\ttoo little indented\n\t}\nEOF",
 	},
 	samePrint("<<-EOF\n\t$foo\nEOF\n\n{\n\tbar\n}"),
+	samePrint("f <<-A\n\ta $(\n\t\tg <<-B\n\t\t\tb1\n\t\t\tb2\n\t\tB\n\t)\nA"),
+	samePrint("f <<-A\n\ta $(\n\t\tg <<-B\n\t\t\tb $(\n\t\t\t\th <<-C\n\t\t\t\t\tc1\n\t\t\t\tC\n\t\t\t)\n\t\tB\n\t)\nA"),
+	samePrint("f <<-EOF\n\tfoo\tbar\nEOF"),
+	samePrint("f <<-EOF\n\ta $(\n\t\techo \"x\ty\"\n\t)\nEOF"),
+	samePrint("f <<-A\n\ta $(\n\t\tg <<B\nb1\nB\n\t)\nA"),
+	samePrint("f <<-A\n\ta $(\n\t\tg <<B\nb1\tx\n\t\tkeep\nB\n\t)\nA"),
+	samePrint("f <<-A\n\ta $(\n\t\tg <<-B\n\t\t\tb $(\n\t\t\t\th <<C\nc1\nC\n\t\t\t)\n\t\tB\n\t)\nA"),
 	samePrint("f <<EOF\nEOF\n# comment"),
 	samePrint("f <<EOF\nEOF\n# comment\nbar"),
 	samePrint("f <<EOF # inline\n$(\n\t# inside\n)\nEOF\n# outside\nbar"),
@@ -837,7 +869,7 @@ func TestPrintBinaryNextLine(t *testing.T) {
 		},
 		{
 			"if foo \\\n&& bar\nthen\nbar\nfi",
-			"if foo \\\n\t&& bar; then\n\tbar\nfi",
+			"if foo \\\n\t&& bar\nthen\n\tbar\nfi",
 		},
 		{
 			"a |\nb |\nc",
@@ -862,6 +894,36 @@ func TestPrintBinaryNextLine(t *testing.T) {
 			"a \\\n\t| b \\\n\t|\n\t#c2\n\tc",
 		},
 		samePrint("a \\\n\t&"),
+		samePrint("[[ a\n\t|| b ]]"),
+		{
+			"[[ a &&\nb ]]",
+			"[[ a\n\t&& b ]]",
+		},
+		{
+			"[[ a ||\nb ||\nc ]]",
+			"[[ a\n\t|| b\n\t|| c ]]",
+		},
+		{
+			"if [[ a ||\nb ]]; then\nc\nfi",
+			"if [[ a\n\t|| b ]]; then\n\tc\nfi",
+		},
+		samePrint("((a \\\n\t|| b))"),
+		{
+			"((a &&\nb))",
+			"((a \\\n\t&& b))",
+		},
+		{
+			"((a ||\nb ||\nc))",
+			"((a \\\n\t|| b \\\n\t|| c))",
+		},
+		{
+			"if ((a ||\nb)); then\nc\nfi",
+			"if ((a \\\n\t|| b)); then\n\tc\nfi",
+		},
+		{
+			"echo $((a +\nb))",
+			"echo $((a \\\n\t+ b))",
+		},
 		{
 			"a \\\n\tb \\\n\tc \\\n\t# EOC",
 			"a \\\n\tb \\\n\tc\n# EOC",
@@ -936,6 +998,94 @@ func TestPrintFunctionNextLine(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			printTest(t, parser, printer, tc.in, tc.want)
 		})
+	}
+}
+
+func TestPrintBlockNextLine(t *testing.T) {
+	t.Parallel()
+	tests := [...]printCase{
+		// Single-line statements are left alone.
+		samePrint("foo() { bar; }"),
+		samePrint("if a; then b; fi"),
+		samePrint("if a; then b; else c; fi"),
+		samePrint("while a; do b; done"),
+		samePrint("for i in 1 2; do b; done"),
+		{
+			"foo() { bar; baz; }",
+			"foo()\n{\n\tbar\n\tbaz\n}",
+		},
+		{
+			"foo() {\n\tbar\n}",
+			"foo()\n{\n\tbar\n}",
+		},
+		{
+			"foo()\n{ bar; }",
+			"foo()\n{\n\tbar\n}",
+		},
+		{
+			"function foo {\n\tbar\n}",
+			"function foo\n{\n\tbar\n}",
+		},
+		{
+			"{ foo() { bar; baz; }; }",
+			"{ foo()\n\t{\n\t\tbar\n\t\tbaz\n\t}; }",
+		},
+		{
+			"{\n\tfoo() { bar; baz; }\n}",
+			"{\n\tfoo()\n\t{\n\t\tbar\n\t\tbaz\n\t}\n}",
+		},
+		{
+			"if a; then\n\tb\nfi",
+			"if a\nthen\n\tb\nfi",
+		},
+		{
+			"if a; then b; c; fi",
+			"if a\nthen\n\tb\n\tc\nfi",
+		},
+		{
+			"if a; then\n\tb\nelif c; then\n\td\nelse\n\te\nfi",
+			"if a\nthen\n\tb\nelif c\nthen\n\td\nelse\n\te\nfi",
+		},
+		{
+			"while a; do\n\tb\ndone",
+			"while a\ndo\n\tb\ndone",
+		},
+		{
+			"until a; do\n\tb\ndone",
+			"until a\ndo\n\tb\ndone",
+		},
+		{
+			"for i in 1 2; do\n\tb\ndone",
+			"for i in 1 2\ndo\n\tb\ndone",
+		},
+		{
+			"select i in 1 2; do\n\tb\ndone",
+			"select i in 1 2\ndo\n\tb\ndone",
+		},
+		{
+			"for i in 1 2 3; do if a; then b; c; fi; d; done",
+			"for i in 1 2 3\ndo\n\tif a\n\tthen\n\t\tb\n\t\tc\n\tfi\n\td\ndone",
+		},
+		// A newline before a coproc's brace would change the program.
+		samePrint("coproc foo {\n\tbar\n\tbaz\n}"),
+		// Only function body braces are placed on their own line.
+		samePrint("foo() (\n\tbar\n\tbaz\n)"),
+		{
+			"foo() if a; then\n\tb\n\tc\nfi",
+			"foo() if a\nthen\n\tb\n\tc\nfi",
+		},
+	}
+	parser := NewParser(KeepComments(true))
+	printer := NewPrinter(BlockNextLine(true))
+	for _, tc := range tests {
+		t.Run("", func(t *testing.T) {
+			printTest(t, parser, printer, tc.in, tc.want)
+		})
+	}
+
+	printer = NewPrinter(FunctionNextLine(true), BlockNextLine(true))
+	if _, err := strPrint(printer, &File{}); err == nil {
+		t.Fatalf("expected an error when mixing FunctionNextLine and BlockNextLine")
 	}
 }
 

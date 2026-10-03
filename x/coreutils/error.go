@@ -3,7 +3,7 @@ package coreutils
 import (
 	"fmt"
 
-	"github.com/0magnet/sh/v3/interp"
+	"mvdan.cc/sh/v3/interp"
 )
 
 // Error wraps any error returned from the core utilities.

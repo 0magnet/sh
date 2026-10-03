@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/0magnet/sh/v3/interp"
-	"github.com/0magnet/sh/v3/syntax"
+	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 func TestExecHandler(t *testing.T) {

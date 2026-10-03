@@ -7,15 +7,18 @@ package interp_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/creack/pty"
 	"github.com/0magnet/sh/v3/interp"
+	"github.com/creack/pty"
 )
 
 func TestRunnerTerminalStdIO(t *testing.T) {
@@ -150,6 +153,64 @@ func TestRunnerTerminalExec(t *testing.T) {
 	}
 }
 
-func shortPathName(path string) (string, error) {
-	panic("only works on windows")
+func TestExecETXTBSY(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "script.sh")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("#!/bin/sh\necho foo\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Hand the write fd to a child process which outlives our close below,
+	// mimicking a concurrent fork inheriting the fd before its exec;
+	// see https://go.dev/issue/22315. Executing the script fails with ETXTBSY
+	// until the child exits, which happens once we close its stdin.
+	holder := exec.Command("cat")
+	holderStdin, err := holder.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder.ExtraFiles = []*os.File{f}
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Wait()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	time.AfterFunc(100*time.Millisecond, func() { holderStdin.Close() })
+	var buf bytes.Buffer
+	r, err := interp.New(interp.StdIO(nil, &buf, &buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(context.Background(), parse(t, nil, path)); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "foo\n" {
+		t.Fatalf("want %q, got %q", "foo\n", got)
+	}
+}
+
+func TestRunnerCommandProcSubst(t *testing.T) {
+	t.Parallel()
+
+	r, _ := interp.New()
+	ctx, cancel := context.WithTimeout(t.Context(), runnerRunTimeout)
+	defer cancel()
+	// Nothing opens the process substitution, so wait would block on it
+	// if running a bare command did not stop waiting on it once done.
+	if err := r.Run(ctx, parse(t, nil, "test -e <(:)").Stmts[0].Cmd); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(ctx, parse(t, nil, "wait")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -1,10 +1,10 @@
-module mvdan.cc/sh/moreinterp
+module mvdan.cc/sh/x
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/u-root/u-root v0.15.1-0.20251208185023-2f8c7e763cf8
-	github.com/0magnet/sh/v3 v3.11.0
+	mvdan.cc/sh/v3 v3.11.0
 )
 
 require (

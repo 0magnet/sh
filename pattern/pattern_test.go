@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"regexp/syntax"
+	"strings"
 	"testing"
 
 	"github.com/go-quicktest/qt"
@@ -59,7 +60,19 @@ var regexpTests = []struct {
 		mustMatch:    []string{"foo", "prefix-foo", "prefix.foo"},
 		mustNotMatch: []string{"foo-suffix", "/prefix/foo", ".foo", ".prefix-foo"},
 	},
-	{pat: `**`, want: `(?s).*.*`},
+	{pat: `**`, want: `(?s).*`},
+	{
+		pat: `a*?*?b`, mode: EntireString, want: `(?s)^a...*b$`,
+		mustMatch:    []string{"axyb", "axyzb"},
+		mustNotMatch: []string{"ab", "axb"},
+	},
+	{pat: `a?*?`, mode: Shortest, want: `(?sU)a...*`},
+	{pat: `**(a)`, mode: ExtendedOperators, want: `(?s).*(a)*`},
+	{pat: `*?(a)`, mode: ExtendedOperators, want: `(?s).*(a)?`},
+	{
+		pat: strings.Repeat("?*", 1<<16), mode: EntireString,
+		want: "(?s)^" + strings.Repeat(".", 1<<16) + ".*$",
+	},
 	{
 		pat: `**`, mode: Filenames | EntireString, want: `(?s)^(/|[^/.][^/]*)*$`,
 		mustMatch:    []string{"/foo", "/prefix/foo", "/a.b.c/foo", "/a/b/c/foo", "/foo/suffix.ext", "/a\n/\nb"},
@@ -74,7 +87,7 @@ var regexpTests = []struct {
 		pat: `**`, mode: Filenames | EntireString | GlobLeadingDot, want: `(?s)^.*$`,
 		mustMatch: []string{"/foo", "/prefix/foo", "/a.b.c/foo", "/a/b/c/foo", "/foo/suffix.ext", "/a\n/\nb", "/.prefix/foo", "/prefix/.foo"},
 	},
-	{pat: `/**/foo`, want: `(?s)/.*.*/foo`},
+	{pat: `/**/foo`, want: `(?s)/.*/foo`},
 	{
 		pat: `/**/foo`, mode: Filenames | EntireString, want: `(?s)^/((/|[^/.][^/]*)*/)?foo$`,
 		mustMatch:    []string{"/foo", "/prefix/foo", "/a.b.c/foo", "/a/b/c/foo"},
@@ -254,6 +267,65 @@ var regexpTests = []struct {
 	{pat: `[!a[:space:]0-9]`, want: `(?s)[^a[:space:]0-9]`},
 	{pat: `[a[:digit]]`, wantErr: `^charClass invalid$`},
 	{pat: `[[:`, wantErr: `^charClass invalid$`},
+	// Like Bash, an unclosed extended operator group is literal text,
+	// and the operator is parsed as a regular character.
+	{
+		pat: `@(a`, mode: ExtendedOperators | EntireString, want: `(?s)^@\(a$`,
+		mustMatch:    []string{"@(a"},
+		mustNotMatch: []string{"a"},
+	},
+	{
+		pat: `@(a|b`, mode: ExtendedOperators | EntireString, want: `(?s)^@\(a\|b$`,
+		mustMatch:    []string{"@(a|b"},
+		mustNotMatch: []string{"a", "b"},
+	},
+	{
+		pat: `*(a`, mode: ExtendedOperators | EntireString, want: `(?s)^.*\(a$`,
+		mustMatch:    []string{"(a", "foo(a"},
+		mustNotMatch: []string{"a"},
+	},
+	{pat: `+(`, mode: ExtendedOperators, want: `(?s)\+\(`},
+	{pat: `!(a`, mode: ExtendedOperators | EntireString, want: `(?s)^!\(a$`},
+	{
+		pat: `@(a|@(b)`, mode: ExtendedOperators | EntireString, want: `(?s)^@\(a\|(b)$`,
+		mustMatch:    []string{"@(a|b"},
+		mustNotMatch: []string{"a", "b"},
+	},
+	{
+		pat: strings.Repeat("@(", 100) + strings.Repeat(")", 100), mode: ExtendedOperators,
+		want: "(?s)" + strings.Repeat("(", 100) + strings.Repeat(")", 100),
+	},
+	{
+		pat: strings.Repeat("@(", 1001) + strings.Repeat(")", 1001), mode: ExtendedOperators,
+		wantErr: `^extended pattern nesting is deeper than 1000 levels$`,
+	},
+	{
+		pat: strings.Repeat("@(", 1<<20) + strings.Repeat(")", 1<<20), mode: ExtendedOperators,
+		wantErr: `^extended pattern nesting is deeper than 1000 levels$`,
+	},
+	{
+		pat: `@(a|@(b|@(c)`, mode: ExtendedOperators | EntireString, want: `(?s)^@\(a\|@\(b\|(c)$`,
+		mustMatch: []string{"@(a|@(b|c"},
+	},
+	{
+		pat: `@(@(a)|@(b`, mode: ExtendedOperators | EntireString, want: `(?s)^@\((a)\|@\(b$`,
+		mustMatch: []string{"@(a|@(b"},
+	},
+	{
+		pat: `@(@(a)|@(b))`, mode: ExtendedOperators | EntireString, want: `(?s)^((a)|(b))$`,
+		mustMatch: []string{"a", "b"},
+	},
+	{
+		pat: strings.Repeat("@(a|", 900), mode: ExtendedOperators | EntireString,
+		want: "(?s)^" + strings.Repeat(`@\(a\|`, 900) + "$",
+	},
+	{pat: `[a[b`, want: `(?s)\[a\[b`},
+	{pat: `[a\[b`, want: `(?s)\[a\[b`},
+	{pat: `[a[b]`, want: `(?s)[a[b]`},
+	{pat: `[a[[:alpha:]`, want: `(?s)\[a\[[:alpha:]`},
+	{pat: `[[:alpha:][`, want: `(?s)\[[:alpha:]\[`},
+	{pat: strings.Repeat("[", 1<<17), want: "(?s)" + strings.Repeat(`\[`, 1<<17)},
+	{pat: strings.Repeat(`[\[`, 1<<16), want: "(?s)" + strings.Repeat(`\[\[`, 1<<16)},
 	{pat: `[[:digit`, wantErr: `^charClass invalid$`},
 	{pat: `[[:wrong:]]`, wantErr: `^charClass invalid$`},
 	{pat: `[[=x=]]`, wantErr: `^charClass invalid$`},

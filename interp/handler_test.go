@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/fstest"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/0magnet/sh/v3/interp"
 	"github.com/0magnet/sh/v3/syntax"
+	"github.com/go-quicktest/qt"
 )
 
 func blocklistOneExec(name string) func(interp.ExecHandlerFunc) interp.ExecHandlerFunc {
@@ -53,6 +55,36 @@ func blocklistNondevOpen(ctx context.Context, path string, flags int, mode os.Fi
 
 func mockFileOpen(ctx context.Context, path string, flags int, mode os.FileMode) (io.ReadWriteCloser, error) {
 	return nopWriterCloser{strings.NewReader(fmt.Sprintf("body of %s", path))}, nil
+}
+
+// virtualProcSubst implements process substitutions entirely in memory
+// via [io.Pipe]; the fake paths never exist in the real filesystem.
+func virtualProcSubst(ctx context.Context, op syntax.ProcOperator) (*interp.ProcSubstFile, error) {
+	pr, pw := io.Pipe()
+	var subshell, consumer io.ReadWriteCloser
+	switch op {
+	case syntax.CmdIn: // the subshell writes, the consumer reads
+		subshell, consumer = rwc{Writer: pw, Closer: pw}, rwc{Reader: pr, Closer: pr}
+	case syntax.CmdOut: // the subshell reads, the consumer writes
+		subshell, consumer = rwc{Reader: pr, Closer: pr}, rwc{Writer: pw, Closer: pw}
+	default:
+		return nil, fmt.Errorf("unexpected process substitution operator: %v", op)
+	}
+	return &interp.ProcSubstFile{
+		Path:         fmt.Sprintf("virtual-procsubst-%d", virtualProcSubstCounter.Add(1)),
+		OpenSubshell: func(ctx context.Context) (io.ReadWriteCloser, error) { return subshell, nil },
+		OpenConsumer: func(ctx context.Context, flag int) (io.ReadWriteCloser, error) { return consumer, nil },
+	}, nil
+}
+
+var virtualProcSubstCounter atomic.Int64
+
+// rwc composes one-directional pipe ends into an [io.ReadWriteCloser];
+// the interpreter never uses the direction left nil.
+type rwc struct {
+	io.Reader
+	io.Writer
+	io.Closer
 }
 
 func blocklistGlob(ctx context.Context, path string) ([]fs.FileInfo, error) {
@@ -108,6 +140,38 @@ func execCustomExitStatus5(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	}
 }
 
+func execExit3(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(ctx context.Context, args []string) error {
+		return interp.Exit(3)
+	}
+}
+
+func execExit0(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(ctx context.Context, args []string) error {
+		return interp.Exit(0)
+	}
+}
+
+var errCustomFatal = errors.New("custom fatal")
+
+func execFatal3(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(ctx context.Context, args []string) error {
+		return interp.Fatal(3, errCustomFatal)
+	}
+}
+
+func execFatal3Wrapped(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(ctx context.Context, args []string) error {
+		return fmt.Errorf("wrapped: %w", interp.Fatal(3, errCustomFatal))
+	}
+}
+
+func execFatal4NoErr(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(ctx context.Context, args []string) error {
+		return interp.Fatal(4, nil)
+	}
+}
+
 func execDotRunnerBuiltin(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		if name, ok := strings.CutPrefix(args[0], "."); ok {
@@ -134,7 +198,9 @@ func execPrintWouldExec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	}
 }
 
-// TODO: join with TestRunnerOpts?
+// modCases stays separate from TestRunnerOpts as it exercises the handlers,
+// which requires the default handlers as a base rather than testExecHandler,
+// and its options are applied to an existing runner rather than via New.
 var modCases = []struct {
 	name string
 	opts []interp.RunnerOption
@@ -353,6 +419,86 @@ var modCases = []struct {
 		want: "Runner.Run error: custom error: exit status 5",
 	},
 	{
+		name: "ExecExit3",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execExit3),
+		},
+		src:  "foo; echo next",
+		want: "Runner.Run error: exit status 3",
+	},
+	{
+		name: "ExecExit0",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execExit0),
+		},
+		src:  "foo; echo next",
+		want: "",
+	},
+	{
+		name: "ExecExit3Trap",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execExit3),
+		},
+		src:  "trap 'echo bye' EXIT; foo; echo next",
+		want: "bye\nRunner.Run error: exit status 3",
+	},
+	{
+		name: "ExecExit3Function",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execExit3),
+		},
+		src:  "f() { foo; echo in-f; }; f; echo next",
+		want: "Runner.Run error: exit status 3",
+	},
+	{
+		name: "ExecExit3CmdSubst",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execExit3),
+		},
+		src:  "echo $(foo)x; echo next",
+		want: "x\nnext\n",
+	},
+	{
+		name: "ExecExit3Subshell",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execExit3),
+		},
+		src:  "(foo); echo $?",
+		want: "3\n",
+	},
+	{
+		name: "ExecFatal3",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execFatal3),
+		},
+		src:  "foo; echo next",
+		want: "Runner.Run error: custom fatal",
+	},
+	{
+		name: "ExecFatal3Trap",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execFatal3),
+		},
+		src:  "trap 'echo bye' EXIT; foo; echo next",
+		want: "bye\nRunner.Run error: custom fatal",
+	},
+	{
+		name: "ExecFatal3Wrapped",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execFatal3Wrapped),
+		},
+		src:  "foo; echo next",
+		want: "Runner.Run error: wrapped: custom fatal",
+	},
+	{
+		name: "ExecFatal4NoErr",
+		opts: []interp.RunnerOption{
+			interp.ExecHandlers(execFatal4NoErr),
+		},
+		src:  "foo; echo next",
+		want: "Runner.Run error: exit status 4",
+	},
+	{
 		name: "ExecDotRunnerBuiltin",
 		opts: []interp.RunnerOption{
 			interp.ExecHandlers(execDotRunnerBuiltin, execExitStatus5),
@@ -455,6 +601,22 @@ var modCases = []struct {
 		src:  "cd vdir && echo ok",
 		want: "ok\n",
 	},
+	{
+		name: "ProcSubstVirtualIn",
+		opts: []interp.RunnerOption{
+			interp.ProcSubstHandler(virtualProcSubst),
+		},
+		src:  `read -r line < <(echo bar); echo "$line"`,
+		want: "bar\n",
+	},
+	{
+		name: "ProcSubstVirtualOut",
+		opts: []interp.RunnerOption{
+			interp.ProcSubstHandler(virtualProcSubst),
+		},
+		src:  `echo hi > >(read -r line; echo "got $line"); wait`,
+		want: "got hi\n",
+	},
 }
 
 func TestRunnerHandlers(t *testing.T) {
@@ -486,6 +648,55 @@ func TestRunnerHandlers(t *testing.T) {
 	}
 }
 
+func TestExitError(t *testing.T) {
+	t.Parallel()
+
+	p := syntax.NewParser()
+	run := func(t *testing.T, handlerErr error) (*interp.Runner, error) {
+		file := parse(t, p, "foo; echo next")
+		r, err := interp.New(interp.ExecHandlers(func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+			return func(ctx context.Context, args []string) error { return handlerErr }
+		}))
+		qt.Assert(t, qt.IsNil(err))
+		return r, r.Run(t.Context(), file)
+	}
+	t.Run("Exit", func(t *testing.T) {
+		r, err := run(t, interp.Exit(3))
+		qt.Assert(t, qt.Equals(err, error(interp.ExitStatus(3))))
+		qt.Assert(t, qt.IsTrue(r.Exited()))
+	})
+	t.Run("ExitZero", func(t *testing.T) {
+		r, err := run(t, interp.Exit(0))
+		qt.Assert(t, qt.IsNil(err))
+		qt.Assert(t, qt.IsTrue(r.Exited()))
+	})
+	t.Run("Fatal", func(t *testing.T) {
+		r, err := run(t, interp.Fatal(3, errCustomFatal))
+		qt.Assert(t, qt.ErrorIs(err, errCustomFatal))
+		qt.Assert(t, qt.ErrorIs(err, interp.ExitStatus(3)))
+		ee, ok := errors.AsType[*interp.ExitError](err)
+		qt.Assert(t, qt.IsTrue(ok))
+		qt.Assert(t, qt.Equals(ee.Status(), 3))
+		qt.Assert(t, qt.IsTrue(r.Exited()))
+	})
+	t.Run("FatalZero", func(t *testing.T) {
+		_, err := run(t, interp.Fatal(0, nil))
+		qt.Assert(t, qt.ErrorIs(err, interp.ExitStatus(1)))
+	})
+	// Like the exit builtin, statuses wrap around modulo 256.
+	t.Run("ExitWrap", func(t *testing.T) {
+		r, err := run(t, interp.Exit(256))
+		qt.Assert(t, qt.IsNil(err))
+		qt.Assert(t, qt.IsTrue(r.Exited()))
+		_, err = run(t, interp.Exit(-1))
+		qt.Assert(t, qt.Equals(err, error(interp.ExitStatus(255))))
+	})
+	t.Run("FatalWrap", func(t *testing.T) {
+		_, err := run(t, interp.Fatal(256, nil))
+		qt.Assert(t, qt.ErrorIs(err, interp.ExitStatus(1)))
+	})
+}
+
 type readyBuffer struct {
 	buf       bytes.Buffer
 	seenReady sync.WaitGroup
@@ -505,6 +716,9 @@ func TestKillTimeout(t *testing.T) {
 	}
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping trap tests on windows")
+	}
+	if !canExec {
+		t.Skipf("skipping test needing subprocesses on %s", runtime.GOOS)
 	}
 	t.Parallel()
 
@@ -559,7 +773,7 @@ func TestKillTimeout(t *testing.T) {
 				}()
 				err = r.Run(ctx, file)
 				if test.forcedKill {
-					if errors.As(err, new(interp.ExitStatus)) || err == nil {
+					if _, ok := errors.AsType[interp.ExitStatus](err); ok || err == nil {
 						t.Error("command was not force-killed")
 					}
 				} else {
@@ -585,6 +799,9 @@ func TestKillTimeout(t *testing.T) {
 func TestKillSignal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping signal tests on windows")
+	}
+	if !canExec {
+		t.Skipf("skipping test needing subprocesses on %s", runtime.GOOS)
 	}
 	tests := []struct {
 		signal os.Signal
@@ -636,5 +853,59 @@ func TestKillSignal(t *testing.T) {
 				t.Fatalf("want error %v, got %v. stderr: %s", test.want, got, stderr)
 			}
 		})
+	}
+}
+
+// When a background statement amounts to starting one external program via
+// the default exec handler, $! expands to its real process ID, and wait
+// accepts it. Note that other tests use exec handler middleware, which keeps
+// the fake "gN" PIDs.
+func TestBackgroundRealPID(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a Unix shell to print the child's PID")
+	}
+	if !canExec {
+		t.Skipf("skipping test needing subprocesses on %s", runtime.GOOS)
+	}
+
+	file := parse(t, nil, "sh -c 'echo child=$$' & pid=$!; wait $pid; echo shell=$pid")
+	var buf bytes.Buffer
+	r, _ := interp.New(interp.StdIO(nil, &buf, &buf))
+	ctx, cancel := context.WithTimeout(t.Context(), runnerRunTimeout)
+	defer cancel()
+	if err := r.Run(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	var child, shell int
+	if n, err := fmt.Sscanf(buf.String(), "child=%d\nshell=%d\n", &child, &shell); n != 2 || err != nil {
+		t.Fatalf("unexpected output: %q", buf.String())
+	}
+	if child != shell {
+		t.Fatalf("child PID %d does not match $! %d", child, shell)
+	}
+}
+
+// A background statement with a redirection must not delay the parent shell:
+// here, opening the FIFO for writing blocks until the parent runs a reader.
+func TestBackgroundRedirFIFO(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs mkfifo")
+	}
+	if !canExec {
+		t.Skipf("skipping test needing subprocesses on %s", runtime.GOOS)
+	}
+
+	file := parse(t, nil, "mkfifo p; echo hi >p & pid=$!; cat p; wait $pid")
+	var buf bytes.Buffer
+	r, _ := interp.New(interp.Dir(t.TempDir()), interp.StdIO(nil, &buf, &buf))
+	ctx, cancel := context.WithTimeout(t.Context(), runnerRunTimeout)
+	defer cancel()
+	if err := r.Run(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "hi\n" {
+		t.Fatalf("unexpected output: %q", got)
 	}
 }

@@ -12,9 +12,9 @@
 //
 // For the sake of efficiency and simplicity, the "Type" key
 // described above must be first in each JSON object.
+//
+// shfmt exposes this format via its --to-json and --from-json flags.
 package typedjson
-
-// TODO: encoding and decoding nodes other than File is untested.
 
 import (
 	"encoding"
@@ -78,8 +78,7 @@ func encodeValue(val reflect.Value) (reflect.Value, string) {
 		// and then all the visible fields which aren't positions.
 		typ := val.Type()
 		fields := []reflect.StructField{typeField, posField, endField}
-		for i := range typ.NumField() {
-			field := typ.Field(i)
+		for field := range typ.Fields() {
 			typ := anyType
 			if field.Type == posType {
 				typ = exportedPosType
@@ -94,7 +93,7 @@ func encodeValue(val reflect.Value) (reflect.Value, string) {
 		enc := reflect.New(encTyp).Elem()
 
 		// Node methods are defined on struct pointer receivers.
-		if node, _ := val.Addr().Interface().(syntax.Node); node != nil {
+		if node, _ := reflect.TypeAssert[syntax.Node](val.Addr()); node != nil {
 			encodePos(enc.Field(1), node.Pos()) // posField
 			encodePos(enc.Field(2), node.End()) // endField
 		}
@@ -183,6 +182,8 @@ type exportedPos struct {
 
 func encodePos(encPtr reflect.Value, val syntax.Pos) {
 	// TODO: perhaps we should encode recovered positions, as that is still useful information.
+	// Note that decoding them back requires a way to build a recovered position,
+	// as [syntax.NewPos] clamps offsets and so can never produce one.
 	if !val.IsValid() {
 		return
 	}
@@ -291,9 +292,15 @@ func (opts DecodeOptions) Decode(r io.Reader) (syntax.Node, error) {
 	return *node, nil
 }
 
+// nodeByName holds every [syntax.Node] type, as any of them may be the root
+// node, which always requires a "Type" key.
 var nodeByName = map[string]reflect.Type{
-	"File": reflect.TypeFor[syntax.File](),
-	"Word": reflect.TypeFor[syntax.Word](),
+	"File":     reflect.TypeFor[syntax.File](),
+	"Comment":  reflect.TypeFor[syntax.Comment](),
+	"Stmt":     reflect.TypeFor[syntax.Stmt](),
+	"Assign":   reflect.TypeFor[syntax.Assign](),
+	"Redirect": reflect.TypeFor[syntax.Redirect](),
+	"Word":     reflect.TypeFor[syntax.Word](),
 
 	"Lit":       reflect.TypeFor[syntax.Lit](),
 	"SglQuoted": reflect.TypeFor[syntax.SglQuoted](),
@@ -333,6 +340,9 @@ var nodeByName = map[string]reflect.Type{
 
 	"WordIter":   reflect.TypeFor[syntax.WordIter](),
 	"CStyleLoop": reflect.TypeFor[syntax.CStyleLoop](),
+	"CaseItem":   reflect.TypeFor[syntax.CaseItem](),
+	"ArrayExpr":  reflect.TypeFor[syntax.ArrayExpr](),
+	"ArrayElem":  reflect.TypeFor[syntax.ArrayElem](),
 }
 
 // decodeValue decodes enc, which comes from untrusted input, into val.

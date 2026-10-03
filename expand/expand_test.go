@@ -9,13 +9,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-quicktest/qt"
 	"github.com/0magnet/sh/v3/syntax"
+	"github.com/go-quicktest/qt"
 )
 
-func parseWord(t *testing.T, src string) *syntax.Word {
+func parseWord(t *testing.T, src string, opts ...syntax.ParserOption) *syntax.Word {
 	t.Helper()
-	p := syntax.NewParser()
+	p := syntax.NewParser(opts...)
 	word, err := p.Document(strings.NewReader(src))
 	if err != nil {
 		t.Fatal(err)
@@ -64,6 +64,13 @@ func TestConfigNils(t *testing.T) {
 	}
 }
 
+func TestMirBSDKornHash(t *testing.T) {
+	t.Parallel()
+	word := parseWord(t, "${foo@#}", syntax.Variant(syntax.LangMirBSDKorn))
+	_, err := Literal(nil, word)
+	qt.Assert(t, qt.ErrorMatches(err, "unsupported"))
+}
+
 func TestFieldsIdempotency(t *testing.T) {
 	tests := []struct {
 		src  string
@@ -87,6 +94,43 @@ func TestFieldsIdempotency(t *testing.T) {
 			}
 			qt.Assert(t, qt.DeepEquals(got, tc.want))
 		}
+	}
+}
+
+func TestFieldsEscapedGlob(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		Env: ListEnviron("PWD=/"),
+		ReadDir2: func(string) ([]fs.DirEntry, error) {
+			return []fs.DirEntry{
+				&mockFileInfo{name: "a.go"},
+				&mockFileInfo{name: "b.go"},
+			}, nil
+		},
+	}
+	tests := []struct {
+		src  string
+		want []string
+	}{
+		{`*.go`, []string{"a.go", "b.go"}},
+		{`"*".go`, []string{"*.go"}},
+		{`'*'.go`, []string{"*.go"}},
+		{`\*.go`, []string{"*.go"}},
+		{`\[a].go`, []string{"[a].go"}},
+		{`a\*`, []string{"a*"}},
+	}
+	for _, tc := range tests {
+		t.Run("", func(t *testing.T) {
+			p := syntax.NewParser()
+			var words []*syntax.Word
+			for w, err := range p.WordsSeq(strings.NewReader(tc.src)) {
+				qt.Assert(t, qt.IsNil(err))
+				words = append(words, w)
+			}
+			got, err := Fields(cfg, words...)
+			qt.Assert(t, qt.IsNil(err))
+			qt.Assert(t, qt.DeepEquals(got, tc.want), qt.Commentf("input: %q", tc.src))
+		})
 	}
 }
 
@@ -120,7 +164,7 @@ func Test_glob(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.pat, func(t *testing.T) {
 			cfg.NoCaseGlob = tc.noCaseGlob
-			got, err := cfg.glob("/", tc.pat)
+			got, err := newExpander(cfg).glob("/", tc.pat)
 			if err != nil {
 				t.Fatalf("did not want error, got %v", err)
 			}

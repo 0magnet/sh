@@ -75,12 +75,12 @@ func TestJobsBuiltin(t *testing.T) {
 	if got := s1.jobsUntil("Exit 3"); got == "" {
 		t.Fatalf("jobs after failure = %q", got)
 	}
-	// A running job reports Running, and -p prints only the fake pids that
-	// $! also reports.
 	if s := runSrc(t, "sleep 30 & jobs; kill %1"); !strings.Contains(s, "Running") {
 		t.Fatalf("jobs while running = %q", s)
 	}
-	if s := runSrc(t, "sleep 30 & jobs -p; kill %1"); strings.TrimSpace(s) != "g1" {
+	// A running job reports Running, and -p prints only the PIDs that
+	// $! also reports.
+	if s := runSrc(t, "sleep 30 & jobs -p; echo $!; kill %1"); strings.Fields(s)[0] != strings.Fields(s)[1] {
 		t.Fatalf("jobs -p = %q", s)
 	}
 	// The two most recent jobs are marked + and -.
@@ -105,7 +105,7 @@ func TestKillBuiltin(t *testing.T) {
 	// Job specs: by number, by the fake pid $! reports, by command prefix and
 	// by substring. A bare integer is not among them any more: it is a PID
 	// and never a job number, as in bash.
-	for _, spec := range []string{"%1", "g1", "%sleep", "%?leep"} {
+	for _, spec := range []string{"%1", "$!", "%sleep", "%?leep"} {
 		k := newSession(t)
 		k.run("sleep 30 & kill " + spec)
 		if got := k.jobsUntil("Terminated"); !strings.Contains(got, "sleep 30") {

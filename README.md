@@ -3,18 +3,22 @@
 [![Go Reference](https://pkg.go.dev/badge/mvdan.cc/sh/v3.svg)](https://pkg.go.dev/mvdan.cc/sh/v3)
 
 A shell parser, formatter, and interpreter.
-Supports [POSIX Shell], [Bash], [Zsh], and [mksh]. Requires Go 1.25 or later.
+Supports [POSIX Shell], [Bash], [Zsh], and [mksh]. Requires Go 1.26 or later.
 
 ### Quick start
 
-To parse shell scripts, inspect them, and print them out,
+To parse shell scripts into a syntax tree, inspect them,
+and format them like `shfmt` does,
 see the [syntax package](https://pkg.go.dev/mvdan.cc/sh/v3/syntax).
 
-For high-level operations like performing shell expansions on strings,
-see the [shell package](https://pkg.go.dev/mvdan.cc/sh/v3/shell).
+For one-call helpers with shell semantics,
+see the [shell package](https://pkg.go.dev/mvdan.cc/sh/v3/shell):
+split a command line into arguments and quote them back like `shlex`,
+expand `$VAR` and `~` in strings, and glob with `**` or match `case`-style patterns.
 
-To interpret or run shell scripts,
-see the [interp package](https://pkg.go.dev/mvdan.cc/sh/v3/interp).
+To run shell scripts without a system shell, including on Windows,
+see the [interp package](https://pkg.go.dev/mvdan.cc/sh/v3/interp);
+its handlers allow configuring what scripts can execute and access.
 
 ### shfmt
 
@@ -29,20 +33,26 @@ For more information, see [its manpage](cmd/shfmt/shfmt.1.scd), which can be
 viewed directly as Markdown or rendered with [scdoc].
 
 Packages are available on [Alpine], [Arch], [Debian], [Docker], [Fedora], [FreeBSD],
-[Homebrew], [MacPorts], [NixOS], [OpenSUSE], [Scoop], [Snapcraft], [Void] and [webi].
+[Homebrew], [MacPorts], [NixOS], [OpenSUSE], [PyPI], [Scoop], [Snapcraft], [Void] and [webi].
 
-### gosh
+### Sponsoring
 
-	go install mvdan.cc/sh/v3/cmd/gosh@latest
+If this project saves you or your company time, consider
+[sponsoring me on GitHub](https://github.com/sponsors/mvdan).
+Monthly tiers include benefits like your logo on a README,
+prioritized issues, or direct support in your company's chat app.
+One-time tiers offer a call about one of my projects
+or a Go consulting or mentorship session.
 
-Proof of concept shell that uses the `interp` package.
+[![CI powered by Namespace](https://namespace.so/oss/badge.svg)](https://namespace.so/github-actions/?utm_source=oss&utm_campaign=sh)
 
-### Fuzzing
+### Contributing
 
-We use Go's native fuzzing support. For instance:
+Bug reports and feature requests should be filed as detailed issues,
+ideally with an example which reproduces the bug or shows what feature you're after.
 
-	cd syntax
-	go test -run=- -fuzz=ParsePrint
+Unless you're an active user or contributor to the project, drive-by AI patches
+are not helpful. File detailed issues instead.
 
 ### Caveats
 
@@ -169,6 +179,7 @@ Other noteworthy integrations include:
 [pre-commit-shfmt]: https://github.com/scop/pre-commit-shfmt
 [prettier-plugin-sh]: https://github.com/un-ts/prettier/tree/master/packages/sh
 [prettier]: https://prettier.io
+[PyPI]: https://pypi.org/project/shfmt-py/
 [scdoc]: https://sr.ht/~sircmpwn/scdoc/
 [scoop]: https://github.com/ScoopInstaller/Main/blob/HEAD/bucket/shfmt.json
 [sh-checker]: https://github.com/luizm/action-sh-checker

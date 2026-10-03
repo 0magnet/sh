@@ -89,6 +89,7 @@ var (
 	spaceRedirs = flagVal("sr", "space-redirects", false, flag.BoolVar)
 	keepPadding = flagVal("kp", "keep-padding", false, flag.BoolVar)
 	funcNext    = flagVal("fn", "func-next-line", false, flag.BoolVar)
+	blockNext   = flagVal("bl", "block-next-line", false, flag.BoolVar)
 	minify      = flagVal("mn", "minify", false, flag.BoolVar)
 
 	// Utility flags.
@@ -112,8 +113,9 @@ func main() {
 		fmt.Fprint(os.Stderr, `usage: shfmt [flags] [path ...]
 
 shfmt formats shell programs. If the only argument is a dash ('-') or no
-arguments are given, standard input will be used. If a given path is a
-directory, all shell scripts found under that directory will be used.
+arguments are given, standard input will be used, unless it is a terminal.
+If a given path is a directory, all shell scripts found under that directory
+will be used.
 
   --version  show version and exit
 
@@ -138,7 +140,8 @@ Printer options:
   -ci, --case-indent       switch cases will be indented
   -sr, --space-redirects   redirect operators will be followed by a space
   -kp, --keep-padding      keep column alignment paddings
-  -fn, --func-next-line    function opening braces are placed on a separate line
+  -fn, --func-next-line    function opening braces are placed on a separate line (deprecated; use -bl)
+  -bl, --block-next-line   multi-line block opening tokens like '{', 'then', and 'do' are placed on a separate line
   -mn, --minify             minify the code to reduce its size (implies -s)
 
 Utilities:
@@ -171,6 +174,10 @@ For more information and to report bugs, see https://github.com/mvdan/sh.
 		fmt.Fprintf(os.Stderr, "-p and -ln=lang cannot coexist\n")
 		os.Exit(1)
 	}
+	if funcNext.val && blockNext.val {
+		fmt.Fprintf(os.Stderr, "-fn and -bl cannot coexist; note that -fn is deprecated\n")
+		os.Exit(1)
+	}
 	if list.val != "true" && list.val != "false" && list.val != "0" {
 		fmt.Fprintf(os.Stderr, "only -l and -l=0 allowed\n")
 		os.Exit(1)
@@ -199,6 +206,7 @@ For more information and to report bugs, see https://github.com/mvdan/sh.
 			spaceRedirs.short, spaceRedirs.long,
 			keepPadding.short, keepPadding.long,
 			funcNext.short, funcNext.long,
+			blockNext.short, blockNext.long,
 			minify.short, minify.long:
 			useEditorConfig = false
 		}
@@ -220,6 +228,7 @@ For more information and to report bugs, see https://github.com/mvdan/sh.
 		syntax.SpaceRedirects(spaceRedirs.val)(printer)
 		syntax.KeepPadding(keepPadding.val)(printer)
 		syntax.FunctionNextLine(funcNext.val)(printer)
+		syntax.BlockNextLine(blockNext.val)(printer)
 	}
 
 	// Decide whether or not to use color for the diff output,
@@ -230,10 +239,14 @@ For more information and to report bugs, see https://github.com/mvdan/sh.
 	} else if term.IsTerminal(int(os.Stdout.Fd())) {
 		color = true
 	}
-	// TODO(v4): show the help text on zero arguments,
-	// having the user run `shfmt -` if they want to format stdin.
-	// Using a dash is more explicit, and new users can easily be
-	// confused by `shfmt` seemingly hanging forever.
+	// Like jq, show the usage text rather than reading standard input
+	// when no arguments are given and stdin is a terminal,
+	// as otherwise new users are confused by shfmt seemingly hanging forever.
+	// An explicit dash still reads stdin, even from a terminal.
+	if flag.NArg() == 0 && term.IsTerminal(int(os.Stdin.Fd())) {
+		flag.Usage()
+		os.Exit(2)
+	}
 	if flag.NArg() == 0 || (flag.NArg() == 1 && flag.Arg(0) == "-") {
 		name := "<standard input>"
 		if toJSON.val {
@@ -412,8 +425,8 @@ var ecQuery = editorconfig.Query{
 }
 
 func propsOptions(lang syntax.LangVariant, props editorconfig.Section) (_ syntax.LangVariant, validLang bool) {
-	// if shell_variant is set to a valid string, it will take precedence
-	langErr := lang.Set(props.Get("shell_variant"))
+	// if language_dialect is set to a valid string, it will take precedence
+	langErr := lang.Set(propGet(props, "language_dialect", "shell_variant"))
 	syntax.Variant(lang)(parser)
 
 	size := uint(0)
@@ -426,12 +439,12 @@ func propsOptions(lang syntax.LangVariant, props editorconfig.Section) (_ syntax
 	syntax.Indent(size)(printer)
 
 	syntax.BinaryNextLine(props.Get("binary_next_line") == "true")(printer)
-	// TODO(v4): rename to case_indent for consistency with flags
-	syntax.SwitchCaseIndent(props.Get("switch_case_indent") == "true")(printer)
+	syntax.SwitchCaseIndent(propGet(props, "case_indent", "switch_case_indent") == "true")(printer)
 	syntax.SpaceRedirects(props.Get("space_redirects") == "true")(printer)
 	syntax.KeepPadding(props.Get("keep_padding") == "true")(printer)
-	// TODO(v4): rename to func_next_line for consistency with flags
+	// TODO(v4): remove along with FunctionNextLine
 	syntax.FunctionNextLine(props.Get("function_next_line") == "true")(printer)
+	syntax.BlockNextLine(props.Get("block_next_line") == "true")(printer)
 
 	minify := props.Get("minify") == "true"
 	syntax.Minify(minify)(printer)
@@ -440,6 +453,20 @@ func propsOptions(lang syntax.LangVariant, props editorconfig.Section) (_ syntax
 	simplify.val = minify || props.Get("simplify") == "true"
 
 	return lang, langErr == nil
+}
+
+// propGet returns the value of the first property which is set.
+// The first name is the one matching the command line flag,
+// and the rest are older spellings which remain supported.
+//
+// TODO(v4): drop the older spellings.
+func propGet(props editorconfig.Section, names ...string) string {
+	for _, name := range names {
+		if prop := props.Lookup(name); prop != nil {
+			return prop.Value
+		}
+	}
+	return ""
 }
 
 func formatPath(path string, checkShebang bool) error {

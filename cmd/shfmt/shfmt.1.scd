@@ -13,8 +13,11 @@ shfmt - Format shell programs
 # DESCRIPTION
 
 shfmt formats shell programs. If the only argument is a dash (*-*) or no
-arguments are given, standard input will be used. If a given path is a
-directory, all shell scripts found under that directory will be used.
+arguments are given, standard input will be used. As an exception, running
+shfmt without arguments on a terminal shows the usage text, as new users
+are otherwise confused by it waiting for input; use a dash to read a terminal.
+If a given path is a directory, all shell scripts found under that directory
+will be used.
 
 If any EditorConfig files are found, they will be used to apply formatting
 options. If any parser or printer flags are given to the tool, no EditorConfig
@@ -109,6 +112,15 @@ predictable. Some aspects of the format can be configured via printer flags.
 *-fn*, *--func-next-line*
 	Function opening braces are placed on a separate line.
 
+	This flag is *DEPRECATED* and will be removed in the next major version;
+	use *-bl* instead. The two flags cannot be used at the same time.
+
+*-bl*, *--block-next-line*
+	The opening tokens of statements which span multiple lines are placed
+	on a separate line: a function's opening brace, *then*, and *do*.
+	Statements formatted on a single line, such as *f() { foo; }* or
+	*if true; then foo; fi*, are not affected.
+
 *-mn*, *--minify*
 	Minify the code to reduce its size (implies *-s*).
 
@@ -148,16 +160,15 @@ showing how to set supported options:
 indent_style = space
 indent_size = 4
 
-# --language-dialect
-shell_variant      = posix
+language_dialect   = posix
 simplify           = true
 binary_next_line   = true
-# --case-indent
-switch_case_indent = true
+case_indent        = true
 space_redirects    = true
 keep_padding       = true
 # --func-next-line
 function_next_line = true
+block_next_line    = true
 minify             = true
 
 # Ignore the entire "third_party" directory when calling shfmt on directories,
@@ -167,6 +178,9 @@ minify             = true
 [third_party/**]
 ignore = true
 ```
+
+The older spellings *shell_variant* and *switch_case_indent* are still
+accepted, but *language_dialect* and *case_indent* take precedence when both are set.
 
 EditorConfig sections may also use `[[shell]]`, `[[bash]]`, or `[[zsh]]` to match shell scripts,
 which is particularly useful when scripts use a shebang but no extension.
