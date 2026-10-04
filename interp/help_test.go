@@ -2,27 +2,14 @@ package interp_test
 
 import (
 	"context"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/0magnet/sh/v3/interp"
 	"github.com/0magnet/sh/v3/syntax"
 )
-
-func runSrc(t *testing.T, src string) string {
-	t.Helper()
-	var out strings.Builder
-	r, err := interp.New(interp.StdIO(strings.NewReader(""), &out, &out))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = r.Run(context.Background(), f)
-	return out.String()
-}
 
 func TestHelpBuiltin(t *testing.T) {
 	all := runSrc(t, "help")
@@ -74,3 +61,40 @@ func TestUmaskAndTimes(t *testing.T) {
 		t.Fatalf("times = %q", s)
 	}
 }
+
+func TestUmaskAppliesToRedirections(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		want os.FileMode
+	}{
+		{"echo hi >f", 0o644},
+		{"umask 077; echo hi >f", 0o600},
+		{"umask 002; echo hi >>f", 0o664},
+	} {
+		var got os.FileMode
+		open := func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+			got = perm
+			return nopFile{}, nil
+		}
+		r, err := interp.New(interp.OpenHandler(open))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := syntax.NewParser().Parse(strings.NewReader(tc.src), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Run(context.Background(), f); err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Errorf("%q created mode %v, want %v", tc.src, got, tc.want)
+		}
+	}
+}
+
+type nopFile struct{}
+
+func (nopFile) Read([]byte) (int, error)    { return 0, io.EOF }
+func (nopFile) Write(p []byte) (int, error) { return len(p), nil }
+func (nopFile) Close() error                { return nil }

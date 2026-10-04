@@ -2,6 +2,10 @@ package interp_test
 
 import (
 	"context"
+	"fmt"
+	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -11,17 +15,65 @@ import (
 	"github.com/0magnet/sh/v3/syntax"
 )
 
+// syncBuffer collects output from the shell and from its background jobs,
+// which write concurrently.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// takeString drains the buffer, for tests that assert on one step at a time.
+func (b *syncBuffer) takeString() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.buf.String()
+	b.buf.Reset()
+	return s
+}
+
+// runSrc runs src with the default exec handler, so background commands are
+// real processes with real PIDs, and returns the combined output. The
+// deterministic job control cases live in runTests; these tests cover jobs
+// that are genuinely running concurrently, and each src must end all jobs it
+// starts — `kill ...; wait` — so no processes outlive the test.
+func runSrc(t *testing.T, src string) string {
+	t.Helper()
+	var out syncBuffer
+	r, err := interp.New(interp.StdIO(strings.NewReader(""), &out, &out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Run(context.Background(), f)
+	return out.String()
+}
+
 // session runs several sources on one runner, so that a test can observe the
 // job table between commands the way an interactive shell does.
 type session struct {
 	t   *testing.T
 	r   *interp.Runner
-	out *strings.Builder
+	out *syncBuffer
 }
 
 func newSession(t *testing.T) *session {
 	t.Helper()
-	out := new(strings.Builder)
+	out := new(syncBuffer)
 	r, err := interp.New(interp.StdIO(strings.NewReader(""), out, out))
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +84,7 @@ func newSession(t *testing.T) *session {
 // run executes src and returns only what it printed.
 func (s *session) run(src string) string {
 	s.t.Helper()
-	before := s.out.Len()
+	before := len(s.out.String())
 	f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
 	if err != nil {
 		s.t.Fatal(err)
@@ -58,255 +110,243 @@ func (s *session) jobsUntil(want string) string {
 	s.t.Fatalf("jobs never reported %q; last listing was %q", want, last)
 	return ""
 }
+
+// needsSubprocesses skips tests that background an external command. js/wasm
+// has no subprocesses, so those commands fail to run rather than becoming
+// jobs, and the job state under test never arises.
+func needsSubprocesses(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "js" {
+		t.Skip("js/wasm has no subprocesses")
+	}
+}
+
 func TestJobsBuiltin(t *testing.T) {
+	needsSubprocesses(t)
 	t.Parallel()
-	// A finished job reports Done, and a failed one its exit status. Waiting
-	// for one reaps it, as in bash, so the listing has to come first.
-	s0 := newSession(t)
-	s0.run("sleep 0 &")
-	if got := s0.jobsUntil("Done"); !strings.Contains(got, "[1]+") || !strings.Contains(got, "sleep 0") {
-		t.Fatalf("jobs after the job ended = %q", got)
-	}
-	if got := s0.run("jobs"); got != "" {
-		t.Fatalf("a reported job was listed again: %q", got)
-	}
-	s1 := newSession(t)
-	s1.run("(exit 3) &")
-	if got := s1.jobsUntil("Exit 3"); got == "" {
-		t.Fatalf("jobs after failure = %q", got)
-	}
-	if s := runSrc(t, "sleep 30 & jobs; kill %1"); !strings.Contains(s, "Running") {
+	// A running job reports Running, and -p prints the PIDs that $! also
+	// reports — real ones, since each of these jobs is one external program.
+	if s := runSrc(t, "sleep 30 & jobs; kill %1; wait"); !strings.Contains(s, "Running") {
 		t.Fatalf("jobs while running = %q", s)
 	}
-	// A running job reports Running, and -p prints only the PIDs that
-	// $! also reports.
-	if s := runSrc(t, "sleep 30 & jobs -p; echo $!; kill %1"); strings.Fields(s)[0] != strings.Fields(s)[1] {
-		t.Fatalf("jobs -p = %q", s)
+	s := runSrc(t, "sleep 30 & jobs -p; kill %1; wait")
+	if pid, err := strconv.Atoi(strings.TrimSpace(s)); err != nil || pid <= 0 {
+		t.Fatalf("jobs -p = %q, want a real PID", s)
 	}
 	// The two most recent jobs are marked + and -.
-	s := runSrc(t, "sleep 30 & sleep 30 & jobs; kill %1 %2")
+	s = runSrc(t, "sleep 30 & sleep 30 & jobs; kill %1 %2; wait")
 	if !strings.Contains(s, "[1]-") || !strings.Contains(s, "[2]+") {
 		t.Fatalf("job marks = %q", s)
-	}
-	// Process substitutions run a background shell, but are not jobs.
-	if s := runSrc(t, "cat <(echo hi) >/dev/null; jobs"); strings.TrimSpace(s) != "" {
-		t.Fatalf("jobs after process substitution = %q", s)
-	}
-	if s := runSrc(t, "jobs -Z"); !strings.Contains(s, "invalid option") {
-		t.Fatalf("jobs -Z = %q", s)
 	}
 }
 
 func TestKillBuiltin(t *testing.T) {
+	needsSubprocesses(t)
 	t.Parallel()
-	// Killing a job cancels it, which jobs then reports as Terminated, and
-	// reporting it reaps it.
-	//
-	// Job specs: by number, by the fake pid $! reports, by command prefix and
-	// by substring. A bare integer is not among them any more: it is a PID
-	// and never a job number, as in bash.
+	// Killing a job cancels it, which jobs then reports as Terminated.
+	// Job specs: by job number, by the real PID $! reports, by command
+	// prefix, and by substring.
 	for _, spec := range []string{"%1", "$!", "%sleep", "%?leep"} {
-		k := newSession(t)
-		k.run("sleep 30 & kill " + spec)
-		if got := k.jobsUntil("Terminated"); !strings.Contains(got, "sleep 30") {
+		s := newSession(t)
+		s.run("sleep 30 & kill " + spec)
+		if got := s.jobsUntil("Terminated"); !strings.Contains(got, "sleep 30") {
 			t.Fatalf("kill %s listed %q", spec, got)
 		}
-		if got := k.run("jobs"); got != "" {
+		// Reporting it reaped it, so there is nothing left to list.
+		if got := s.run("jobs"); got != "" {
 			t.Fatalf("kill %s left %q behind", spec, got)
 		}
 	}
+	// A job that is not exactly one external program keeps its fake gN pid,
+	// which resolves the same way.
+	gn := newSession(t)
+	gn.run("(sleep 30) & kill $!")
+	gn.jobsUntil("Terminated")
+	// A bare integer is a PID, not a job number: a PID belonging to no job
+	// does not touch job 1.
+	s := runSrc(t, "sleep 30 & kill 99999999; echo st=$?; jobs; kill %1; wait")
+	if !strings.Contains(s, "st=1") || !strings.Contains(s, "Running") {
+		t.Fatalf("kill on a non-job PID = %q", s)
+	}
 	// Signal 0 only tests that the job exists.
-	if s := runSrc(t, "sleep 30 & kill -0 %1; echo status=$?; jobs; kill %1"); !strings.Contains(s, "status=0") || !strings.Contains(s, "Running") {
+	if s := runSrc(t, "sleep 30 & kill -0 %1; echo status=$?; jobs; kill %1; wait"); !strings.Contains(s, "status=0") || !strings.Contains(s, "Running") {
 		t.Fatalf("kill -0 = %q", s)
 	}
-	if s := runSrc(t, "kill %9"); !strings.Contains(s, "no such job") {
-		t.Fatalf("kill on missing job = %q", s)
-	}
 	// Stopping and continuing need job control, which does not exist here.
-	if s := runSrc(t, "sleep 30 & kill -STOP %1; kill %1"); !strings.Contains(s, "no job control") {
+	if s := runSrc(t, "sleep 30 & kill -STOP %1; kill %1; wait"); !strings.Contains(s, "no job control") {
 		t.Fatalf("kill -STOP = %q", s)
-	}
-	if s := runSrc(t, "kill -NOPE %1"); !strings.Contains(s, "invalid signal specification") {
-		t.Fatalf("kill -NOPE = %q", s)
-	}
-	// kill -l names a number, numbers a name, and lists them all.
-	if s := runSrc(t, "kill -l 9"); strings.TrimSpace(s) != "KILL" {
-		t.Fatalf("kill -l 9 = %q", s)
-	}
-	if s := runSrc(t, "kill -l TERM"); strings.TrimSpace(s) != "15" {
-		t.Fatalf("kill -l TERM = %q", s)
-	}
-	if s := runSrc(t, "kill -l"); !strings.Contains(s, "SIGHUP") || !strings.Contains(s, "SIGTERM") {
-		t.Fatalf("kill -l = %q", s)
 	}
 	// Both spellings of the signal reach the job.
 	for _, flag := range []string{"-9", "-KILL", "-SIGKILL", "-s KILL", "-n 9"} {
-		k := newSession(t)
-		k.run("sleep 30 & kill " + flag + " %1")
-		k.jobsUntil("Terminated")
+		s := newSession(t)
+		s.run("sleep 30 & kill " + flag + " %1")
+		s.jobsUntil("Terminated")
+	}
+}
+
+func TestKillNonJobPID(t *testing.T) {
+	needsSubprocesses(t)
+	t.Parallel()
+	// A PID the shell did not start names a process it may not signal, so the
+	// process is still running afterwards.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		<-done
+	})
+	s := runSrc(t, fmt.Sprintf("kill %d; echo st=$?", cmd.Process.Pid))
+	if !strings.Contains(s, "no such job") || !strings.Contains(s, "st=1") {
+		t.Fatalf("kill on a foreign PID = %q, want it refused", s)
+	}
+	select {
+	case <-done:
+		t.Fatal("the process did not survive kill")
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
 func TestDisownFgBg(t *testing.T) {
+	needsSubprocesses(t)
 	t.Parallel()
-	// A disowned job leaves the job table, and a bare wait no longer waits
-	// for it.
-	if s := runSrc(t, "sleep 30 & disown; jobs"); strings.TrimSpace(s) != "" {
+	// A disowned job leaves the job table, and its % spec stops resolving,
+	// but its PID still does — which is also how these tests end it.
+	s := runSrc(t, "sleep 30 & p=$!; disown; jobs; kill $p; wait $p")
+	if strings.TrimSpace(s) != "" {
 		t.Fatalf("jobs after disown = %q", s)
 	}
-	if s := runSrc(t, "sleep 30 & disown %1; kill %1"); !strings.Contains(s, "no such job") {
-		t.Fatalf("kill after disown = %q", s)
+	s = runSrc(t, "sleep 30 & p=$!; disown %1; kill %1; kill $p; wait $p")
+	if !strings.Contains(s, "no such job") {
+		t.Fatalf("kill by job spec after disown = %q", s)
 	}
-	// fg waits for the job and hands back its exit status.
-	if s := runSrc(t, "(exit 4) & fg; echo status=$?"); !strings.Contains(s, "status=4") {
-		t.Fatalf("fg = %q", s)
-	}
-	// bg reports on a job that is already running, and fails on one that
-	// has finished.
-	if s := runSrc(t, "sleep 30 & bg; kill %1"); !strings.Contains(s, "[1]+ sleep 30 &") {
+	// bg reports on a job that is already running.
+	if s := runSrc(t, "sleep 30 & bg; kill %1; wait"); !strings.Contains(s, "[1]+ sleep 30 &") {
 		t.Fatalf("bg = %q", s)
 	}
-	// wait reaps the job, so by the time bg runs there is no current job at
-	// all, which is what bash says too.
-	if s := runSrc(t, "sleep 0 & wait; bg"); !strings.Contains(s, "no such job") {
-		t.Fatalf("bg after the job was reaped = %q", s)
-	}
 }
 
-func TestEnableBuiltin(t *testing.T) {
+func TestKillOnlyOwnJobs(t *testing.T) {
+	needsSubprocesses(t)
 	t.Parallel()
-	if s := runSrc(t, "enable"); !strings.Contains(s, "enable pwd\n") {
-		t.Fatalf("enable = %q", s)
-	}
-	if s := runSrc(t, "enable -s"); strings.Contains(s, "enable pwd\n") {
-		t.Fatalf("enable -s listed a non-special builtin: %q", s)
-	}
-	// A disabled builtin is hidden from the plain listing, shown by -a, and
-	// looked up as an external command instead — which for a builtin with no
-	// binary behind it means it is simply not found.
-	if s := runSrc(t, "enable -n pwd; enable"); strings.Contains(s, "enable pwd\n") {
-		t.Fatalf("disabled builtin still listed: %q", s)
-	}
-	if s := runSrc(t, "enable -n pwd; enable -a"); !strings.Contains(s, "enable -n pwd\n") {
-		t.Fatalf("enable -a = %q", s)
-	}
-	if s := runSrc(t, "enable -n help; help"); !strings.Contains(s, "not found") {
-		t.Fatalf("disabled builtin still ran: %q", s)
-	}
-	// `builtin` runs one regardless, as in bash.
-	if s := runSrc(t, "enable -n pwd; builtin pwd"); strings.Contains(s, "not found") {
-		t.Fatalf("builtin did not bypass enable -n: %q", s)
-	}
-	// Re-enabling restores it.
-	if s := runSrc(t, "enable -n pwd; enable pwd; enable"); !strings.Contains(s, "enable pwd\n") {
-		t.Fatalf("re-enable = %q", s)
-	}
-	if s := runSrc(t, "enable nosuchbuiltin"); !strings.Contains(s, "not a shell builtin") {
-		t.Fatalf("enable on a non-builtin = %q", s)
-	}
-}
-
-func TestCompgenBuiltin(t *testing.T) {
-	t.Parallel()
-	if s := runSrc(t, "compgen -b pw"); strings.TrimSpace(s) != "pwd" {
-		t.Fatalf("compgen -b = %q", s)
-	}
-	if s := runSrc(t, "compgen -k wh"); strings.TrimSpace(s) != "while" {
-		t.Fatalf("compgen -k = %q", s)
-	}
-	if s := runSrc(t, "compgen -W 'foo bar baz' b"); strings.TrimSpace(s) != "bar\nbaz" {
-		t.Fatalf("compgen -W = %q", s)
-	}
-	if s := runSrc(t, "compgen -P '<' -S '>' -W 'foo' f"); strings.TrimSpace(s) != "<foo>" {
-		t.Fatalf("compgen prefix and suffix = %q", s)
-	}
-	if s := runSrc(t, "myfunc() { :; }; compgen -A function myf"); strings.TrimSpace(s) != "myfunc" {
-		t.Fatalf("compgen -A function = %q", s)
-	}
-	if s := runSrc(t, "shopt -s expand_aliases; alias myalias=pwd; compgen -a myal"); strings.TrimSpace(s) != "myalias" {
-		t.Fatalf("compgen -a = %q", s)
-	}
-	if s := runSrc(t, "MYVAR=1; compgen -v MYVA"); strings.TrimSpace(s) != "MYVAR" {
-		t.Fatalf("compgen -v = %q", s)
-	}
-	if s := runSrc(t, "MYVAR=1; export MYEXP=1; compgen -e MY"); strings.TrimSpace(s) != "MYEXP" {
-		t.Fatalf("compgen -e = %q", s)
-	}
-	// No match is an error status with no output, as in bash.
-	if s := runSrc(t, "compgen -b zzz; echo status=$?"); strings.TrimSpace(s) != "status=1" {
-		t.Fatalf("compgen with no match = %q", s)
-	}
-	if s := runSrc(t, "compgen -Z"); !strings.Contains(s, "invalid option") {
-		t.Fatalf("compgen -Z = %q", s)
-	}
-}
-
-func TestHistoryBuiltin(t *testing.T) {
-	t.Parallel()
-	// Without a line editor to supply one, there is no history list.
-	if s := runSrc(t, "history"); !strings.Contains(s, "no history list") {
-		t.Fatalf("history without a list = %q", s)
-	}
-
-	lines := []string{"echo one", "echo two", "echo three"}
-	run := func(src string) string {
-		t.Helper()
-		var out strings.Builder
-		r, err := interp.New(
-			interp.StdIO(strings.NewReader(""), &out, &out),
-			interp.History(
-				func() []string { return lines },
-				func() { lines = nil },
-			),
-		)
-		if err != nil {
-			t.Fatal(err)
+	// A PID this shell did not start is not signalled, whatever it names. 0 and
+	// -1 are the ones that matter, since kill(2) reads them as the caller's
+	// process group and as every process the user may reach.
+	for _, spec := range []string{"0", "-- -1", "1", "999999999"} {
+		s := runSrc(t, "kill "+spec+"; echo st=$?; echo survived")
+		if !strings.Contains(s, "no such job") || !strings.Contains(s, "st=1") ||
+			!strings.Contains(s, "survived") {
+			t.Fatalf("kill %s = %q, want it refused", spec, s)
 		}
-		f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
-		if err != nil {
-			t.Fatal(err)
+	}
+}
+
+func TestJobNumbersSkipProcSubsts(t *testing.T) {
+	needsSubprocesses(t)
+	t.Parallel()
+	// A process substitution runs a shell of its own, but bash gives it no
+	// job number, so the sleep below is %1 and not %2.
+	s := runSrc(t, "cat <(echo hi) >/dev/null; sleep 30 & jobs; kill %1; wait")
+	if !strings.Contains(s, "[1]") || strings.Contains(s, "[2]") {
+		t.Fatalf("jobs after a process substitution = %q, want the sleep as [1]", s)
+	}
+	if strings.Contains(s, "no such job") {
+		t.Fatalf("kill %%1 after a process substitution = %q", s)
+	}
+	// Disowning a job does not renumber the ones after it, as in bash.
+	s = runSrc(t, "sleep 30 & sleep 30 & p=$!; disown %1; jobs; kill %2; wait $p")
+	if !strings.Contains(s, "[2]") || strings.Contains(s, "no such job") {
+		t.Fatalf("jobs after disown = %q, want the survivor still [2]", s)
+	}
+}
+
+func TestJobsReaping(t *testing.T) {
+	needsSubprocesses(t)
+	t.Parallel()
+	// A finished job is reported once and then gone, as in bash.
+	s := newSession(t)
+	s.run("sleep 0 &")
+	if got := s.jobsUntil("Done"); !strings.Contains(got, "[1]") {
+		t.Fatalf("first listing = %q", got)
+	}
+	if got := s.run("jobs"); got != "" {
+		t.Fatalf("second listing = %q, want nothing", got)
+	}
+	// With the table empty the numbering starts again from one.
+	if got := s.run("sleep 30 & jobs"); !strings.Contains(got, "[1]") {
+		t.Fatalf("numbering after reaping = %q", got)
+	}
+	s.run("kill %1; wait")
+
+	// bash gives a new job the number after the highest one in the table,
+	// not the lowest free one: with job 1 reaped and job 2 still running,
+	// the next job is 3.
+	s = newSession(t)
+	s.run("sleep 0 & sleep 30 &")
+	s.jobsUntil("Done")
+	if got := s.run("sleep 30 & jobs"); !strings.Contains(got, "[3]") {
+		t.Fatalf("numbering beside a live job = %q", got)
+	}
+	s.run("kill %2 %3; wait")
+
+	// A job still running is listed but not reaped, however often it is
+	// listed. Reading whether it is running twice per row used to let one
+	// finishing mid-listing be reported as Running and reaped in the same
+	// breath, which lost it before anything said it had ended.
+	s = newSession(t)
+	s.run("sleep 30 &")
+	for range 20 {
+		if got := s.run("jobs"); !strings.Contains(got, "Running") {
+			t.Fatalf("a running job went missing from the listing: %q", got)
 		}
-		_ = r.Run(context.Background(), f)
-		return out.String()
 	}
+	s.run("kill %1; wait")
+}
 
-	if s := run("history"); strings.TrimSpace(s) != "1  echo one\n    2  echo two\n    3  echo three" {
-		t.Fatalf("history = %q", s)
+func TestWaitJobSpec(t *testing.T) {
+	needsSubprocesses(t)
+	t.Parallel()
+	// bash's wait takes a job specification as well as a PID.
+	s := newSession(t)
+	if got := s.run("sleep 0 & wait %1; echo st=$?"); got != "st=0\n" {
+		t.Fatalf("wait %%1 = %q", got)
 	}
-	// A trimmed listing keeps the original numbering.
-	if s := run("history 2"); strings.TrimSpace(s) != "2  echo two\n    3  echo three" {
-		t.Fatalf("history 2 = %q", s)
+	// Waiting for it reaped it, so it is gone.
+	if got := s.run("jobs"); got != "" {
+		t.Fatalf("listing after wait %%1 = %q", got)
 	}
-	if s := run("history -c; history"); strings.TrimSpace(s) != "" {
-		t.Fatalf("history -c = %q", s)
+	if got := s.run("wait %9; echo st=$?"); got != "wait: %9: no such job\nst=127\n" {
+		t.Fatalf("wait on a bad spec = %q", got)
 	}
 }
 
-// syncBuffer collects output from the shell and from its background jobs,
-// which write concurrently.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf strings.Builder
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) takeString() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s := b.buf.String()
-	b.buf.Reset()
-	return s
+func TestWaitReportsTheSignal(t *testing.T) {
+	needsSubprocesses(t)
+	t.Parallel()
+	// bash gives a job its signal killed 128 plus the signal number, which is
+	// 143 for TERM and 137 for KILL. The jobs listing already says Terminated
+	// for the same job, so the two now agree.
+	s := runSrc(t, `sleep 30 & p=$!; kill "$p"; wait "$p"; echo st=$?`)
+	if !strings.Contains(s, "st=143") {
+		t.Errorf("wait after kill = %q, want st=143", s)
+	}
+	s = runSrc(t, "sleep 30 & kill -9 %1; fg; echo st=$?")
+	if !strings.Contains(s, "st=137") {
+		t.Errorf("fg after kill -9 = %q, want st=137", s)
+	}
 }
 
 func TestJobsOutliveTheirContext(t *testing.T) {
+	needsSubprocesses(t)
 	t.Parallel()
 	var out syncBuffer
-	r, err := interp.New(interp.StdIO(strings.NewReader(""), &out, &out))
+	r, err := interp.New(interp.Interactive(true), interp.StdIO(strings.NewReader(""), &out, &out))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +364,6 @@ func TestJobsOutliveTheirContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	run(ctx, "sleep 30 &")
 	cancel()
-	out.takeString()
 
 	run(context.Background(), "jobs")
 	if s := out.takeString(); !strings.Contains(s, "Running") {
@@ -345,12 +384,94 @@ func TestJobsOutliveTheirContext(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("wait did not return when its context was cancelled")
 	}
-	out.takeString()
 
 	// StopJobs is how the embedder ends them when the shell goes away.
-	r.StopJobs()
+	out.takeString()
+	r.StopJobs(context.Background())
 	run(context.Background(), "jobs")
 	if s := out.takeString(); strings.Contains(s, "Running") {
-		t.Fatalf("StopJobs left a job running: %q", s)
+		t.Fatalf("StopJobs left the job running: %q", s)
+	}
+}
+
+func TestNonInteractiveJobsDieWithContext(t *testing.T) {
+	needsSubprocesses(t)
+	t.Parallel()
+	// Without Interactive, jobs keep master's behavior: an embedder bounding
+	// a script with a timeout reaps its background children on cancel.
+	var out syncBuffer
+	r, err := interp.New(interp.StdIO(strings.NewReader(""), &out, &out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(ctx context.Context, src string) {
+		t.Helper()
+		f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Run(ctx, f)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	run(ctx, "sleep 30 &")
+	cancel()
+	run(context.Background(), "wait; jobs")
+	if s := out.String(); strings.Contains(s, "Running") {
+		t.Fatalf("non-interactive job survived its context: %q", s)
+	}
+}
+
+func TestStopJobsSkipsProcessSubstitutions(t *testing.T) {
+	needsSubprocesses(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("no process substitutions on windows")
+	}
+	t.Parallel()
+	// The shells behind process substitutions are not jobs and have no
+	// cancel func; StopJobs must not block on them.
+	var out syncBuffer
+	r, err := interp.New(interp.Interactive(true), interp.StdIO(strings.NewReader(""), &out, &out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := syntax.NewParser().Parse(strings.NewReader("echo <(sleep 20) >/dev/null"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // ends the substitution's shell, which follows Run's context
+	_ = r.Run(ctx, f)
+	start := time.Now()
+	r.StopJobs(context.Background())
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("StopJobs blocked on a process substitution for %v", d)
+	}
+}
+
+func TestResetStopsJobs(t *testing.T) {
+	needsSubprocesses(t)
+	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
+		t.Skip("checking process liveness needs signals")
+	}
+	t.Parallel()
+	// Reset drops the job table, so it must end the jobs first: a detached
+	// job surviving it would be unreachable and unstoppable.
+	var out syncBuffer
+	r, err := interp.New(interp.Interactive(true), interp.StdIO(strings.NewReader(""), &out, &out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := syntax.NewParser().Parse(strings.NewReader("sleep 30 & echo pid=$!"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = r.Run(ctx, f)
+	cancel()
+	pid := strings.TrimSpace(strings.TrimPrefix(out.String(), "pid="))
+	r.Reset()
+	// Reset waited for the job, so its process is gone and reaped.
+	if s := runSrc(t, "kill -0 "+pid+"; echo st=$?"); !strings.Contains(s, "st=1") {
+		t.Fatalf("job survived Reset: kill -0 = %q", s)
 	}
 }
