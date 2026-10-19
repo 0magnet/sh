@@ -114,6 +114,51 @@ func virtualDirAccess(ctx context.Context, path string, mode interp.AccessMode) 
 	return interp.DefaultAccessHandler()(ctx, path, mode)
 }
 
+// virtualUnixFS is a virtual filesystem with Unix paths, such as a remote
+// Linux machine, which must resolve as such on every OS; see issue #1433.
+var virtualUnixFS = fstest.MapFS{
+	"tmp/file":  {},
+	"etc/hosts": {},
+}
+
+func virtualUnixName(path string) (string, error) {
+	if path == "/" {
+		return ".", nil
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "", &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+	}
+	return path[1:], nil
+}
+
+func virtualUnixStat(ctx context.Context, path string, followSymlinks bool) (fs.FileInfo, error) {
+	name, err := virtualUnixName(path)
+	if err != nil {
+		return nil, err
+	}
+	return fs.Stat(virtualUnixFS, name)
+}
+
+func virtualUnixAccess(ctx context.Context, path string, mode interp.AccessMode) error {
+	_, err := virtualUnixStat(ctx, path, true)
+	return err
+}
+
+func virtualUnixReadDir(ctx context.Context, path string) ([]fs.DirEntry, error) {
+	name, err := virtualUnixName(path)
+	if err != nil {
+		return nil, err
+	}
+	return fs.ReadDir(virtualUnixFS, name)
+}
+
+// virtualUnixDir sets Runner.Dir directly, as interp.Dir would resolve "/"
+// as an OS path and stat it.
+func virtualUnixDir(r *interp.Runner) error {
+	r.Dir = "/"
+	return nil
+}
+
 func execPrint(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		hc := interp.HandlerCtx(ctx)
@@ -602,6 +647,18 @@ var modCases = []struct {
 		want: "ok\n",
 	},
 	{
+		name: "VirtualUnixPaths",
+		opts: []interp.RunnerOption{
+			interp.StatHandler(virtualUnixStat),
+			interp.AccessHandler(virtualUnixAccess),
+			interp.ReadDirHandler2(virtualUnixReadDir),
+			virtualUnixDir,
+		},
+		src: `cd /tmp && echo "$PWD"; cd .. && echo "$PWD"; cd etc && echo "$PWD"
+[ -f /etc/hosts ] && echo found; echo /etc/* *`,
+		want: "/tmp\n/\n/etc\nfound\n/etc/hosts hosts\n",
+	},
+	{
 		name: "ProcSubstVirtualIn",
 		opts: []interp.RunnerOption{
 			interp.ProcSubstHandler(virtualProcSubst),
@@ -908,4 +965,82 @@ func TestBackgroundRedirFIFO(t *testing.T) {
 	if got := buf.String(); got != "hi\n" {
 		t.Fatalf("unexpected output: %q", got)
 	}
+}
+
+// execStall returns an exec handler which blocks until the context is
+// cancelled, closing started once it is called and setting finished once it
+// is done, so that tests can tell whether a background job has been joined.
+func execStall(started chan<- struct{}, finished *atomic.Bool) func(interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			close(started)
+			<-ctx.Done()
+			finished.Store(true)
+			return nil
+		}
+	}
+}
+
+// TestWaitBackground checks that WaitBackground joins background jobs and
+// process substitutions which outlive Run, wherever they were started.
+func TestWaitBackground(t *testing.T) {
+	t.Parallel()
+	scripts := []string{
+		"stall &",
+		"(stall &)",
+		"true | { stall & }",
+		": < <(stall)",
+	}
+	for _, script := range scripts {
+		t.Run(script, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			started := make(chan struct{})
+			var finished atomic.Bool
+			runner, err := interp.New(
+				interp.ExecHandlers(execStall(started, &finished)),
+				interp.ProcSubstHandler(virtualProcSubst),
+			)
+			qt.Assert(t, qt.IsNil(err))
+			qt.Assert(t, qt.IsNil(runner.Run(ctx, parse(t, nil, script))))
+
+			// Run returned without waiting for the job,
+			// which only finishes once the context is cancelled.
+			<-started
+			cancel()
+			runner.WaitBackground()
+			qt.Assert(t, qt.IsTrue(finished.Load()))
+		})
+	}
+}
+
+// TestWaitBackgroundSubshell checks that the output of a background job has
+// fully arrived once WaitBackground returns, that a copy made via Subshell
+// waits for its own jobs rather than its parent's, and that a reset keeps
+// waiting for the jobs started before it.
+func TestWaitBackgroundSubshell(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	started := make(chan struct{})
+	var finished atomic.Bool
+	var out bytes.Buffer
+	runner, err := interp.New(
+		interp.ExecHandlers(execStall(started, &finished)),
+		interp.StdIO(nil, &out, &out),
+	)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.IsNil(runner.Run(ctx, parse(t, nil, "stall &"))))
+	<-started
+
+	sub := runner.Subshell()
+	qt.Assert(t, qt.IsNil(sub.Run(t.Context(), parse(t, nil, "(echo sub) &"))))
+	sub.WaitBackground()
+	qt.Assert(t, qt.Equals(out.String(), "sub\n"))
+
+	runner.Reset()
+	cancel()
+	runner.WaitBackground()
+	qt.Assert(t, qt.IsTrue(finished.Load()))
 }

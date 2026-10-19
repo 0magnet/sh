@@ -56,6 +56,46 @@ var braceTests = []struct {
 		litWords("ab", "ac"),
 	},
 	{
+		litWord("{foo},1}"),
+		litWords("foo}", "1"),
+	},
+	{
+		litWord("{a},b}"),
+		litWords("a}", "b"),
+	},
+	{
+		litWord("{{a}},b}"),
+		litWords("{a}}", "b"),
+	},
+	{
+		litWord("{a..},b}"),
+		litWords("a..}", "b"),
+	},
+	{
+		litWord("x{a},b}"),
+		litWords("xa}", "xb"),
+	},
+	{
+		litWord("{x{a},b}"),
+		litWords("x{a}", "b"),
+	},
+	{
+		litWord("{a..c},d}"),
+		litWords("a,d}", "b,d}", "c,d}"),
+	},
+	{
+		litWord("{},a}"),
+		litWords("{},a}"),
+	},
+	{
+		litWord("x{},a}"),
+		litWords("x}", "xa"),
+	},
+	{
+		litWord("{a,b}{},c}"),
+		litWords("a{},c}", "b{},c}"),
+	},
+	{
 		litWord("a{à,世界}"),
 		litWords("aà", "a世界"),
 	},
@@ -198,6 +238,18 @@ var braceTests = []struct {
 	{
 		litWord("a{1..2..3..4}"),
 		litWords("a{1..2..3..4}"),
+	},
+	{
+		litWord("{1..2{a,b}}"),
+		litWords("{1..2{a,b}}"),
+	},
+	{
+		litWord("{x..2{a,b}}"),
+		litWords("{x..2a}", "{x..2b}"),
+	},
+	{
+		litWord("{a.{x,y}..b}"),
+		litWords("{a.{x,y}..b}"),
 	},
 	{
 		litWord("{9223372036854775806..9223372036854775807}"),

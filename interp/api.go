@@ -64,7 +64,7 @@ type Runner struct {
 
 	// writeEnv overlays [Runner.Env] so that we can write environment variables
 	// as an overlay.
-	writeEnv expand.WriteEnviron
+	writeEnv *overlayEnviron
 
 	// Dir specifies the working directory of the command, which must be an
 	// absolute path. It can only be set via [Dir].
@@ -75,7 +75,8 @@ type Runner struct {
 	// slash-separated paths with a volume prefix such as C:/foo or //srv/share,
 	// treating backslashes only as escapes, and convert at the OS boundary.
 	// Environment values imported from the OS stay as-is; see the TODO on
-	// [expand.Config.ReadDir2] for the globbing side.
+	// [expand.Config.ReadDir2] for the globbing side. [internal.PathsFor]
+	// already applies this model to a virtual filesystem's Unix paths.
 	Dir string
 
 	// tempDir is either $TMPDIR from [Runner.Env], or [os.TempDir].
@@ -107,6 +108,10 @@ type Runner struct {
 	Funcs map[string]*syntax.Stmt
 
 	alias map[string]alias
+
+	// sharedFuncs and sharedAlias are set when Funcs and alias are shared
+	// with a parent shell; see [Runner.subshell].
+	sharedFuncs, sharedAlias bool
 
 	// callHandler is a function allowing to replace a simple command's
 	// arguments. It may be nil.
@@ -145,7 +150,7 @@ type Runner struct {
 	// procSubstUses counts the users which may still open each process
 	// substitution expanded by the statements being run here or by a parent:
 	// the statement itself, and any background subshells started meanwhile.
-	procSubstUses []*sync.WaitGroup
+	procSubstUses []*procSubstUse
 
 	// procSubsts tracks this runner's active process substitutions;
 	// see [procSubstRegistry]. It must be non-nil.
@@ -239,6 +244,17 @@ type Runner struct {
 	// jobsBase from its parent rather than from the Run it is given.
 	inSubshell bool
 
+	// bgJobs counts the goroutines for background shells and process
+	// substitutions, which may outlive [Runner.Run]; see [Runner.WaitBackground].
+	// Copies made via [Runner.Subshell] have their own, as they may start
+	// jobs while this runner waits. It must be non-nil.
+	bgJobs *sync.WaitGroup
+
+	// pipeProcSubsts holds the done channels of the process substitutions
+	// started by the last command of a pipeline, which runs in a subshell.
+	// They are not jobs of this shell, but a plain wait still waits for them.
+	pipeProcSubsts []chan struct{}
+
 	// bgStarted is non-nil when this runner is a background subshell
 	// whose statement may amount to starting one external program;
 	// the runner reports through it once via [Runner.reportBgStart].
@@ -303,6 +319,10 @@ type exitStatus struct {
 	exiting   bool // whether the current shell is exiting
 	fatalExit bool // whether the current shell is exiting due to a fatal error; err below must not be nil
 
+	// discarding is set along with exiting when an error abandons the
+	// commands being run without exiting the shell; see [Runner.scriptStmts].
+	discarding bool
+
 	// err holds the error information for a non-zero exit status code or fatal error.
 	// Used so that running a single statement with a custom handler
 	// which returns a non-fatal Go error, such as a Go error wrapping [NewExitStatus],
@@ -329,6 +349,17 @@ func (e *exitStatus) oneIf(b bool) {
 	if b {
 		e.code = 1
 	}
+}
+
+// discard fails the current command and abandons the rest of its line,
+// unless the shell is already exiting.
+func (e *exitStatus) discard() {
+	if e.exiting && !e.discarding {
+		return
+	}
+	e.code = 1
+	e.exiting = true
+	e.discarding = true
 }
 
 func (e *exitStatus) fatal(err error) {
@@ -377,6 +408,9 @@ type bgProc struct {
 	// Read it via [Runner.bgProcID].
 	id string
 
+	// procSubst is set for a process substitution rather than a job.
+	procSubst bool
+
 	// started, when non-nil, delivers the report from [Runner.reportBgStart]:
 	// the process ID when the background statement started exactly one
 	// external program, and zero otherwise.
@@ -385,15 +419,6 @@ type bgProc struct {
 	// cmd is the source text of the backgrounded statement, as the jobs
 	// builtin prints it.
 	cmd string
-
-	// substitution marks the shells behind process substitutions, which bash
-	// does not list as jobs either. They have no job number, cannot be named
-	// by a job spec, and a bare wait does not wait for them.
-	//
-	// A separate field rather than testing cmd == "": an empty command string
-	// is a plausible thing to have for other reasons, and every place that
-	// asked "is this a real job" was really asking this.
-	substitution bool
 
 	// cancel stops the background shell. A job here is a goroutine rather
 	// than an operating system process, so the kill builtin cancels its
@@ -434,7 +459,7 @@ func (r *Runner) newBgProc() *bgProc {
 	// next job is 3 and not 1.
 	num := 0
 	for _, bg := range r.bgProcs {
-		if !bg.substitution && bg.num > num {
+		if !bg.procSubst && bg.num > num {
 			num = bg.num
 		}
 	}
@@ -511,6 +536,7 @@ func New(opts ...RunnerOption) (*Runner, error) {
 		accessHandler:        DefaultAccessHandler(),
 		procSubstHandler:     DefaultProcSubstHandler(),
 		procSubsts:           &procSubstRegistry{},
+		bgJobs:               new(sync.WaitGroup),
 
 		// Options like Params("-o") may print before StdIO is applied.
 		stdout: io.Discard,
@@ -995,6 +1021,11 @@ var bashOptsTable = [...]bashOpt{
 		supported:    true,
 	},
 	{
+		name:         "lastpipe",
+		defaultState: false,
+		supported:    true,
+	},
+	{
 		name:         "nocaseglob",
 		defaultState: false,
 		supported:    true,
@@ -1061,7 +1092,6 @@ var bashOptsTable = [...]bashOpt{
 		name:         "interactive_comments",
 		defaultState: true,
 	},
-	{name: "lastpipe"},
 	{name: "lithist"},
 	{name: "localvar_inherit"},
 	{name: "localvar_unset"},
@@ -1106,6 +1136,7 @@ const (
 	optExpandAliases
 	optExtGlob
 	optGlobStar
+	optLastPipe
 	optNoCaseGlob
 	optNullGlob
 )
@@ -1170,6 +1201,7 @@ func (r *Runner) Reset() {
 		procSubsts:           r.procSubsts,
 		historyList:          r.historyList,
 		historyClear:         r.historyClear,
+		bgJobs:               r.bgJobs,
 
 		// These can be set by functions like [Dir] or [Params], but
 		// builtins can overwrite them; reset the fields to whatever the
@@ -1343,6 +1375,9 @@ func IsExitStatus(err error) (status uint8, ok bool) {
 //
 // Calling Run on an entire [*File] implies an exit, meaning that an exit trap may
 // run.
+//
+// Run does not wait for background shells or process substitutions, which may
+// keep running and writing output after it returns; see [Runner.WaitBackground].
 func (r *Runner) Run(ctx context.Context, node syntax.Node) error {
 	if !r.didReset {
 		r.Reset()
@@ -1369,13 +1404,15 @@ func (r *Runner) Run(ctx context.Context, node syntax.Node) error {
 	switch node := node.(type) {
 	case *syntax.File:
 		r.filename = node.Name
-		r.stmts(ctx, node.Stmts)
+		r.scriptStmts(ctx, node.Stmts)
 	case *syntax.Stmt:
 		r.stmt(ctx, node)
+		r.endDiscard()
 	case syntax.Command:
 		n := len(r.procSubstUses)
 		r.cmd(ctx, node)
 		r.releaseProcSubsts(n) // a bare Command bypasses stmt
+		r.endDiscard()
 	default:
 		return fmt.Errorf("node can only be File, Stmt, or Command: %T", node)
 	}
@@ -1416,6 +1453,34 @@ func (r *Runner) Exited() bool {
 	return r.exit.exiting
 }
 
+// unshareFuncs copies Funcs if they are shared with a parent shell.
+func (r *Runner) unshareFuncs() {
+	if r.sharedFuncs {
+		r.Funcs = maps.Clone(r.Funcs)
+		r.sharedFuncs = false
+	}
+}
+
+// unshareAlias copies alias if it is shared with a parent shell.
+func (r *Runner) unshareAlias() {
+	if r.sharedAlias {
+		r.alias = maps.Clone(r.alias)
+		r.sharedAlias = false
+	}
+}
+
+// WaitBackground waits for all background shells and process substitutions
+// started by this runner or its subshells. Unlike the wait builtin, it covers
+// jobs started by subshells such as `(cmd &)`, and it does not affect the exit
+// status. It does not cover processes left behind by external programs,
+// nor the jobs of copies made via [Runner.Subshell].
+//
+// Call it after [Runner.Run] returns. To stop the jobs rather than wait for
+// them to finish, cancel the context given to Run first.
+func (r *Runner) WaitBackground() {
+	r.bgJobs.Wait()
+}
+
 // Subshell makes a copy of the given [Runner], suitable for use concurrently
 // with the original. The copy will have the same environment, including
 // variables and functions, but they can all be modified without affecting the
@@ -1427,7 +1492,9 @@ func (r *Runner) Exited() bool {
 // To replace e.g. stdin/out/err, do [StdIO](r.stdin, r.stdout, r.stderr)(r) on
 // the copy.
 func (r *Runner) Subshell() *Runner {
-	return r.subshell(true)
+	r2 := r.subshell(true)
+	r2.bgJobs = new(sync.WaitGroup)
+	return r2
 }
 
 // subshell is like [Runner.Subshell], but allows skipping some allocations and copies
@@ -1455,10 +1522,13 @@ func (r *Runner) subshell(background bool) *Runner {
 		accessHandler:        r.accessHandler,
 		procSubstHandler:     r.procSubstHandler,
 		procSubsts:           r.procSubsts,
+		bgJobs:               r.bgJobs,
 		stdin:                r.stdin,
 		stdout:               r.stdout,
 		stderr:               r.stderr,
 		filename:             r.filename,
+		inFunc:               r.inFunc,
+		inSource:             r.inSource,
 		opts:                 r.opts,
 		usedNew:              r.usedNew,
 		exit:                 r.exit,
@@ -1475,11 +1545,19 @@ func (r *Runner) subshell(background bool) *Runner {
 		origStdout: r.origStdout, // used for process substitutions
 	}
 	r2.disabledBuiltins = maps.Clone(r.disabledBuiltins)
-	r2.writeEnv = newOverlayEnviron(r.writeEnv, background)
-	// Funcs are copied, since they might be modified.
-	r2.Funcs = maps.Clone(r.Funcs)
+	// Variables, funcs, and aliases might be modified. A subshell which
+	// does not run alongside the parent shell only copies them once it
+	// first modifies them.
+	r2.Funcs, r2.alias = r.Funcs, r.alias
+	r2.sharedFuncs, r2.sharedAlias = true, true
+	if background {
+		r2.writeEnv = r.writeEnv.clone()
+		r2.unshareFuncs()
+		r2.unshareAlias()
+	} else {
+		r2.writeEnv = r.writeEnv.share()
+	}
 	r2.Vars = make(map[string]expand.Variable)
-	r2.alias = maps.Clone(r.alias)
 
 	r2.dirStack = append(r2.dirBootstrap[:0], r.dirStack...)
 	r2.fillExpandConfig(r.ectx)

@@ -303,6 +303,8 @@ var runTests = []runTest{
 	{"cd a b", "usage: cd [dir]\nexit status 2 #JUSTERR"},
 	{"shift a", "usage: shift [n]\nexit status 2 #JUSTERR"},
 	{"set -- a b; shift -1; echo $? $@", "shift: -1: shift count out of range\n1 a b\n #JUSTERR"},
+	// Shifting past the end fails silently, leaving the parameters alone.
+	{"set -- a b; shift 5; echo $? $#; shift 2; echo $? $#; shift; echo $? $#", "1 2\n0 0\n1 0\n"},
 	{
 		"shouldnotexist",
 		"\"shouldnotexist\": executable file not found in $PATH\nexit status 127 #JUSTERR",
@@ -584,8 +586,15 @@ var runTests = []runTest{
 		// A failed assignment must not seed, so that RANDOM keeps its
 		// attributes like any other variable.
 		"readonly RANDOM; RANDOM=99; echo $?",
-		"RANDOM: readonly variable\n1\n #JUSTERR",
+		"RANDOM: readonly variable\nexit status 1 #JUSTERR",
 	},
+	// Bash treats a local or temporary RANDOM as a plain variable. Ours
+	// always expands to random numbers, a known divergence which is not
+	// worth implementing.
+	{"RANDOM=3 eval '[[ $RANDOM$RANDOM == 33 ]]'; echo $?", "1\n #IGNORE it expands to random numbers; not worth implementing"},
+	{"f() { [[ $RANDOM == 3 ]]; echo $?; RANDOM=9; [[ $RANDOM == 9 ]]; echo $?; }; RANDOM=3 f", "1\n1\n #IGNORE it expands to random numbers; not worth implementing"},
+	{"f() { local RANDOM=3; [[ $RANDOM$RANDOM == 33 ]]; echo $?; }; f", "1\n #IGNORE it expands to random numbers; not worth implementing"},
+	{"f() { local RANDOM; [[ -z $RANDOM ]]; echo $?; }; f", "1\n #IGNORE it expands to random numbers; not worth implementing"},
 	{"[[ $SRANDOM -eq $SRANDOM ]]", "exit status 1"}, // 1 in 2**32 chance of a collision,
 
 	// Ensure that we consistently use 64 bits even on 32-bit platforms.
@@ -609,9 +618,22 @@ var runTests = []runTest{
 		"3 3 3 3\n",
 	},
 	{"set -- a bc; echo ${#@} ${#*} $#", "2 2 2\n"},
+	// Positional parameters beyond $9 need braces.
+	{"set -- 1 2 3 4 5 6 7 8 9 10 11; echo ${10} ${11} ${!#} $#", "10 11 11 11\n"},
+	{`set -- 1 2 3 4 5 6 7 8 9 10 11; echo "${10:-d}" ${10-d} ${12-d} ${#10} ${10:1}`, "10 10 d 2 0\n"},
+	{
+		"set --; echo ${1=x}; echo after",
+		"$1: cannot assign in this way\nexit status 1 #JUSTERR",
+	},
+	{
+		"echo ${@=x}; echo after",
+		"$@: cannot assign in this way\nexit status 1 #JUSTERR",
+	},
+	// ++ and -- on a number rather than a variable apply the sign twice.
+	{"x=5; echo $((--x)) $x $((--5)) $((++5)) $((- -5)); echo after", "4 4 5 5 5\nafter\n"},
 	{
 		"echo ${!a}; echo more",
-		"invalid indirect expansion\nexit status 1 #JUSTERR",
+		"a: invalid indirect expansion\nexit status 1 #JUSTERR",
 	},
 	{
 		"a=b; echo ${!a}; b=c; echo ${!a}",
@@ -1655,8 +1677,9 @@ var runTests = []runTest{
 		"statement nesting is deeper than 10000 levels #IGNORE bash has no limit by default",
 	},
 	{
-		`o='(' c=')'; for i in {1..12}; do o=$o$o c=$c$c; done; eval "f() { echo \$(( $o\$(f)$c )); }"; f 2>err; read -r l <err; echo "$l"`,
-		"statement nesting is deeper than 10000 levels\n #IGNORE bash has no limit by default",
+		`o='(' c=')'; for i in {1..12}; do o=$o$o c=$c$c; done; eval "f() { echo \$(( $o\$(f)$c )); }"; f 2>err
+read -r l <err; echo "$l"`,
+		"0\nstatement nesting is deeper than 10000 levels\n #IGNORE bash has no limit by default",
 	},
 	{
 		`o='${x:-' c='}'; for i in {1..13}; do o=$o$o c=$c$c; done; eval "f() { echo \"$o\$(f)$c\"; }"; f 2>err; read -r l <err; echo "$l"`,
@@ -2304,6 +2327,11 @@ var runTests = []runTest{
 		"__b__\nb__\n",
 	},
 	{
+		// Quoted and escaped characters match literally.
+		`[[ axb =~ a\.b ]] && echo 1; [[ axb =~ "a.b" ]] && echo 2; r=a.b; [[ axb =~ $r ]] && echo 3; [[ axb =~ "$r" ]] && echo 4; [[ 'a\b' =~ ^a\\b$ ]] && echo 5`,
+		"3\n5\n",
+	},
+	{
 		"[[ -e a ]] && echo x; >a; [[ -e a ]] && echo y",
 		"y\n",
 	},
@@ -2597,7 +2625,7 @@ var runTests = []runTest{
 		"1 0 2\n",
 	},
 	{
-		"x=0; echo $((1/0 && x++)); echo $x",
+		"x=0; echo $((1/0 && x++))\necho $x",
 		"division by zero\n0\n #JUSTERR",
 	},
 	{
@@ -2629,7 +2657,7 @@ var runTests = []runTest{
 		"8 0\n",
 	},
 	{
-		"echo $((2 ** -1)); let x=2**-1",
+		"let x=2**-1; echo $((2 ** -1))",
 		"exponent less than 0\nexponent less than 0\nexit status 1 #JUSTERR",
 	},
 	{
@@ -2724,16 +2752,74 @@ var runTests = []runTest{
 	},
 	{
 		"a=b b=a; echo $(($a))",
-		"0\n #IGNORE bash prints a warning",
+		"b: expression recursion level exceeded\nexit status 1 #JUSTERR",
+	},
+	// A variable's value is evaluated as an arithmetic expression.
+	{"a='1+2'; echo $((a*2)) $((a))", "6 3\n"},
+	{"x=' 5 '; echo $((x+1)); y='b+1'; b=2; echo $((y))", "6\n3\n"},
+	{"x='1+2'; ((x++)); echo $x; y='1+2'; let y++; echo $y", "4\n4\n"},
+	{"x=b; b=c; c=7; echo $((x))", "7\n"},
+	{"a=; echo $((a+1)); unset u; echo $((u+1))", "1\n1\n"},
+	{"x='2#101'; echo $((x)); x='0x1f'; echo $((x+1)); x=-3; echo $((x)) $((-x))", "5\n32\n-3 3\n"},
+	{"let 'a = 5 + 4'; echo $a", "9\n"},
+	// Bash substitutes an expansion like $x before parsing the expression,
+	// so that x='1+2' gives $(($x*2)) a value of 5. We evaluate the expanded
+	// word as an expression of its own, a known divergence which only shows
+	// when an expansion holds an operator, and is not worth implementing.
+	{"x='1+2'; echo $(($x*2)) $((${x}*2)) $((\"$x\"*2)) $(($x$x))", "6 6 6 24\n #IGNORE an expansion is evaluated on its own; not worth implementing"},
+	{"a=1 b=2; echo $((-$a)) $(($a - -$b)) $(($a$b + 1)) $(($(echo 1+1) * 2))", "-1 3 13 4\n #IGNORE an expansion is evaluated on its own; not worth implementing"},
+	{"x='1+2'; a=(5 6 7); i=1; echo $((a[$i] * $x)) $((${a[$i]} + $x * 2)) ${a[@]:$i:$x-2}", "18 12 6\n #IGNORE an expansion is evaluated on its own; not worth implementing"},
+	{"i='1+1'; a=(0 1 2 3 4); echo $((a[$i*2])); ((a[$i*2] = 9)); ((a[$i*2]++)); let \"a[$i*2] += 1\"; echo ${a[@]}", "4\n0 1 2 4 10\n #IGNORE an expansion is evaluated on its own; not worth implementing"},
+	{"x='1+2'; let r=$x*2; ((r2 = $x * 2)); echo $r $r2; (($x > 2)) && echo gt", "6 6\ngt\n #IGNORE an expansion is evaluated on its own; not worth implementing"},
+	{"e=; echo $(($e + 1)); (echo $(($e * 2))) 2>/dev/null; echo $?", "1\n0\n0\n #IGNORE an expansion is evaluated on its own; not worth implementing"},
+	{"x=5 y=1; echo $((- -x + $y)) $((+ +x + $y)) $((! !x + $y)) $x; x=-y y=3; echo $((- $x)) $((-$x)) $y", "6 6 2 5\n3 3 3\n #IGNORE an expansion is evaluated on its own; not worth implementing"},
+	// A value is not subject to expansions like $y or $(cmd), except
+	// within an array subscript.
+	{"x='$(echo 42)'; (echo $((x))) 2>/dev/null; echo $?", "1\n"},
+	{"x='$(echo 42)'; (echo $(($x))) 2>/dev/null; echo $?", "1\n"},
+	{"y=3; x='$y'; (echo $((x))) 2>/dev/null; echo $?", "1\n"},
+	{"(let 'x=$(echo 3)') 2>/dev/null; echo $?", "1\n"},
+	{"a=(1 2); x='a[$(echo 1)]'; echo $((x))", "2\n"},
+	{"echo $((16#ff)) $((36#Zz)) $((37#a)) $((37#A)) $((64#_))", "255 1295 10 36 63\n"},
+	// Values which are not numbers nor expressions fail, which exits
+	// the shell in an expansion but not in an arithmetic command.
+	{
+		"echo $((08)); echo after",
+		"08: value too great for base\nexit status 1 #JUSTERR",
 	},
 	{
-		"let x=3; let 3/0; ((3/0)); echo $((x/y)); let x/=0",
+		"x=1a; echo $((x+1)); echo after",
+		"1a: value too great for base\nexit status 1 #JUSTERR",
+	},
+	{
+		"x='3 4'; echo $((x+1)); echo after",
+		"3 4: arithmetic syntax error in expression\nexit status 1 #JUSTERR",
+	},
+	{
+		"a=a; echo $((a+1)); echo after",
+		"a: expression recursion level exceeded\nexit status 1 #JUSTERR",
+	},
+	{
+		"x=08; ((x)); echo after $?; let y=x+1; echo after $?",
+		"08: value too great for base\nafter 1\n08: value too great for base\nafter 1\n #JUSTERR",
+	},
+	{"exec 2>/dev/null; let a=1/0 b=1; echo $? ${b-unset}", "1 unset\n"},
+	{
+		"let x=3; let 3/0; ((3/0)); let x/=0; echo $((x/y))",
 		"division by zero\ndivision by zero\ndivision by zero\ndivision by zero\nexit status 1 #JUSTERR",
 	},
 	{
-		"let x=3; let 3%0; ((3%0)); echo $((x%y)); let x%=0",
+		"let x=3; let 3%0; ((3%0)); let x%=0; echo $((x%y))",
 		"division by zero\ndivision by zero\ndivision by zero\ndivision by zero\nexit status 1 #JUSTERR",
 	},
+	// Any arithmetic error in an expansion abandons the rest of the line,
+	// including a slice offset, or $((...)) within an arithmetic command.
+	{
+		"exec 2>/dev/null\necho $((1/0)); echo same\nx=$((08)); echo same\n((1 + $((1/0)))); echo same\nx=ab; echo ${x:1/0}; echo same\necho after",
+		"after\n",
+	},
+	// The offset and length of an unset variable are not evaluated.
+	{"echo ${u:1/0} ${u:1:1/0}; echo same", "\nsame\n"},
 	{
 		"let x=' 3'; echo $x",
 		"3\n",
@@ -3027,6 +3113,100 @@ set +o pipefail
 		"f() { local a=1; echo $a; unset a; echo $a; }; f",
 		"1\n\n",
 	},
+	// Variables are dynamically scoped: a function sees and modifies
+	// its caller's locals, and declare -g reaches the global scope.
+	{"x=0; f() { local x=1; declare -g x=2; echo $x; }; f; echo $x", "1\n2\n"},
+	{"x=0; f() { local x=1; g; echo $x; }; g() { declare -g x=2; echo $x; }; f; echo $x", "1\n1\n2\n"},
+	{"f() { typeset t=1; }; f; echo \"[${t-unset}]\"", "[unset]\n"},
+	{"x=g; f() { local x=l; g; echo $x; }; g() { unset x; echo ${x-unset}; }; f", "g\ng\n"},
+	{"x=0; f() { local x=1; g; echo \"f: ${x-unset}\"; }; g() { unset x; x=5; echo \"g: $x\"; }; f; echo $x", "g: 5\nf: 5\n5\n"},
+	{"x=0; f() { local x=1; unset x; x=2; echo \"f: $x\"; }; f; echo $x", "f: 2\n0\n"},
+	{"x=0; f() { local x=1; unset x; g; }; g() { echo \"g: ${x-unset}\"; }; f", "g: unset\n"},
+	{"x=g; f() { local x+=a; echo $x; }; f; echo $x", "a\ng\n"},
+	{"x=(1 2); f() { local x+=(3); echo ${x[@]}; }; f", "3\n"},
+	{"f() { local x=1; (x=2; echo $x); echo $x; }; f", "2\n1\n"},
+	{"f() { local x=1; (unset x; echo ${x-unset}); echo $x; }; f", "unset\n1\n"},
+	{"x=g; f() { local x=1; g; }; g() { (declare -g x=2; echo \"[$x]\"); echo \"[$x]\"; }; f; echo $x", "[1]\n[1]\ng\n"},
+	{"f() { local x=1; readonly x; }; f; x=2; echo $x", "2\n"},
+	{
+		"readonly r=1; f() { local r=2; echo \"f $r\"; }; f; echo st=$?",
+		"local: r: readonly variable\nf 1\nst=0\n #JUSTERR",
+	},
+	{
+		"f() { local x=1; readonly x; local x=2; echo st=$? $x; }; f",
+		"local: x: readonly variable\nst=1 1\n #JUSTERR",
+	},
+	// Bash expands all scalar values before any assignment, and then
+	// applies them in order, whereas an array is assigned as soon as it is
+	// expanded. We expand and assign each in turn, a known divergence
+	// which only shows when a value refers to an earlier name, and is not
+	// worth implementing.
+	{"a=1; declare a=2 b=$a; echo $b", "2\n #IGNORE values are expanded and assigned in turn; not worth implementing"},
+	{"f() { local a=1 b=$a; echo \"[$b]\"; }; f", "[1]\n #IGNORE values are expanded and assigned in turn; not worth implementing"},
+	{"x=old; declare x=new x+=suffix; echo $x", "newsuffix\n"},
+	{"f() { local x=1 x+=2; echo $x; }; f", "12\n"},
+	{"declare a=(1 2) a[0]=9 a[1]=8; echo ${a[@]}", "9 8\n"},
+	{"declare -a a=(1) a+=(2) a+=(3); echo ${a[@]}", "1 2 3\n"},
+	{"declare a=(1 2) b=(\"${a[@]}\"); echo ${b[@]}", "1 2\n"},
+	{"declare x=5 a=($x); echo ${#a[@]}", "1\n #IGNORE values are expanded and assigned in turn; not worth implementing"},
+	{"x=(9); f() { local x=(1 2) y=(\"${x[@]}\"); echo ${y[@]}; }; f; echo ${x[@]}", "1 2\n9\n"},
+	// Flags may be combined, and -- ends them.
+	{"declare -rx y=1; declare -p y", "declare -rx y=\"1\"\n"},
+	{"declare -- x=1; echo $x", "1\n"},
+	{"declare -- -y; echo $?; declare -r -- -x >/dev/null; echo $?", "declare: invalid name \"-y\"\n1\ndeclare: invalid name \"-x\"\n1\n #JUSTERR"},
+	{"f() { local -- -y; echo $?; }; f; export -- -y; echo $?; readonly -- -y; echo $?", "declare: invalid name \"-y\"\n1\ndeclare: invalid name \"-y\"\n1\ndeclare: invalid name \"-y\"\n1\n #JUSTERR"},
+	{
+		"declare -ar a=(1); a[1]=2; echo after",
+		"a: readonly variable\nexit status 1 #JUSTERR",
+	},
+	// Prefix assignments form a temporary environment for the command,
+	// which a function sees as its caller's scope.
+	{"f() { declare -g x=2; }; x=1 f; echo $x", "2\n"},
+	{"f() { x=3; }; x=1 f; echo \"[$x]\"", "[]\n"},
+	{"x=0; f() { echo \"in f: $x\"; x=3; g; }; g() { echo \"in g: $x\"; }; x=1 f; echo \"[$x]\"", "in f: 1\nin g: 3\n[0]\n"},
+	{"f() { echo \"$x\"; }; x=1; x=2 f; x+=3 f", "2\n13\n"},
+	// Including for declaration builtins.
+	{`f() { IFS=: local x=1 y=(a b); echo "$x ${y[1]}"; }; f`, "1 b\n"},
+	{`x=1 declare -p x; echo "[$x]"`, "declare -x x=\"1\"\n[]\n"},
+	{`x=1 declare y=2; echo "[$x] $y"`, "[] 2\n"},
+	{`x=1 export y=3; echo "[$x] $y"`, "[] 3\n"},
+	{`f() { IFS=: local x=($(echo a:b)); echo ${#x[@]}; }; f`, "1\n"},
+	{`x=0; x=1 export y=$x; echo "[$y]"`, "[0]\n"},
+	{`y=1; y=2 declare z=$y y=3; echo "[$y] $z"`, "[1] 1\n"},
+	{`x=1 declare x; echo "[$x]"`, "[]\n"},
+	{`x=1 export x; echo "[$x]"; declare -p x`, "[1]\ndeclare -x x=\"1\"\n"},
+	{`x=0; x=1 export x=2; echo "[$x]"`, "[2]\n"},
+	{`x=1 readonly x; declare -p x`, "declare -rx x=\"1\"\n"},
+	{`x=1 declare -x x; echo "[$x]"`, "[1]\n"},
+	{`case $(xx=1 declare -p; xx=1 export -p) in *-x\ x[x]=*) echo found ;; esac; echo end`, "end\n"},
+	{`f() { x=1 local x=2; echo "[$x]"; }; f; echo "[$x]"`, "[2]\n[]\n"},
+	{`f() { x=1 local x; declare -p x; }; f`, "declare -x x=\"1\"\n"},
+	{`f() { local x=0; x=1 export x; echo "[$x]"; }; f; echo "[$x]"`, "[1]\n[]\n"},
+	// A local declared under a temporary environment, like in eval or
+	// source, belongs to the function.
+	{`f() { x=1 eval 'local y=2; declare -a q=(1 2)'; echo "[$y]"; declare -p q; }; f; echo "[$y]"`, "[2]\ndeclare -a q=([0]=\"1\" [1]=\"2\")\n[]\n"},
+	// Each prefix assignment sees the earlier ones.
+	{"x=old; f() { echo $x $y; }; x=new y=$x f", "new new\n"},
+	{"x=old; f() { echo $x; }; x=new x+=! f; echo $x", "new!\nold\n"},
+	// Bash gives a new local the value of a temporary variable of the same
+	// name. We start it empty, a known divergence which is not worth
+	// implementing.
+	{"f() { x=1 g; }; g() { local x; declare -p x; echo \"[$x]\"; }; f", "declare -x x\n[]\n #IGNORE a new local starts empty; not worth implementing"},
+	{"x=0; f() { x=1 g; }; g() { local x; x=5; }; f; echo $x", "0\n"},
+	{"f() { x=1 g; }; g() { local x=2; $ENV_PROG | grep '^x='; }; f", "x=2\n"},
+	// A local under a temporary environment holding a variable of the
+	// same name modifies that variable, starting empty unlike in Bash.
+	{`x=0; f() { x=1 eval 'local x; echo "[$x]"; local x=2; echo "[$x]"'; echo "[$x]"; }; f; echo "[$x]"`, "[]\n[2]\n[0]\n[0]\n #IGNORE a new local starts empty; not worth implementing"},
+	{
+		"readonly r=1; r=2 echo hi; echo st=$?",
+		"r: readonly variable\nhi\nst=0\n #JUSTERR",
+	},
+	// A local variable without a value does not hide an exported
+	// variable from a program, even in a pipeline.
+	{"export INTERP_X=1; f() { local INTERP_X; echo | $ENV_PROG | grep ^INTERP_X=; echo \"${INTERP_X-unset}\"; }; f", "INTERP_X=1\nunset\n"},
+	{"export INTERP_X=1; f() { local INTERP_X=2; $ENV_PROG | grep ^INTERP_X=; }; f", "INTERP_X=2\n"},
+	// A program does not see a stale exported value.
+	{"export INTERP_X=1; unset INTERP_X; INTERP_X=3; $ENV_PROG | grep ^INTERP_X=; echo st=$?", "st=1\n"},
 	{
 		`a=b eval 'echo $a; unset a; echo $a'`,
 		"b\n\n",
@@ -3562,6 +3742,72 @@ done <<< 2`,
 		`declare -A a; a[a]=x; a[b]=y; declare -A a; for v in "${!a[@]}"; do echo "$v"; done | sort`,
 		"a\nb\n",
 	},
+	// list expansions of associative arrays
+	{`declare -A A; echo "${#A[@]}" "${#A[*]}"`, "0 0\n"},
+	{`declare -A A=([a]=1 [b]=2 [c]=3); echo ${#A[@]} ${#A[*]}`, "3 3\n"},
+	{
+		`declare -A A=([b]=2 [a]=1); echo "${!A[@]}" "${A[@]}" ${!A[*]} ${A[*]}`,
+		"a b 1 2 a b 1 2\n #IGNORE bash orders the elements by hash",
+	},
+	{`declare -A A=([a]=x); printf "<%s>" "${A[@]@U}" "${!A[@]}"; echo`, "<X><a>\n"},
+
+	// list expansions within a longer quoted string
+	{`a=(1 2); printf "<%s>" "x${a[@]}y"; echo`, "<x1><2y>\n"},
+	{`a=(1 2); printf "<%s>" "x${a[*]}y"; echo`, "<x1 2y>\n"},
+	{`a=(); printf "<%s>" "x${a[@]}y"; echo`, "<xy>\n"},
+	{`a=("" ""); printf "<%s>" "${a[@]}b" "-${a[@]}"; echo`, "<><b><-><>\n"},
+	{`a=(1 2); b=(3 4); printf "<%s>" "a${a[@]}b${b[@]}c" "${a[@]}${b[@]}"; echo`, "<a1><2b3><4c><1><23><4>\n"},
+	{`set -- 1 2; printf "<%s>" "x$@y" "x${@}y" "x$*y"; echo`, "<x1><2y><x1><2y><x1 2y>\n"},
+	{`set --; printf "<%s>" "x$@y" "$@" "x$@"; echo`, "<xy><x>\n"},
+	// A quoted string holding an empty list and no literal text produces
+	// no field when it expands to nothing.
+	{`a=(); x=; set --; set -- "${a[@]}${a[@]}" "$@$x" "${a[*]}$@" "$@$(true)"; echo $#`, "0\n"},
+	{`a=(); e=(''); x=; set --; set -- """$@" "$@"'' "${e[@]}$x" "${a[*]}$x" "$@x"; echo $#`, "5\n"},
+
+	// operators testing a list as a whole
+	{`a=(); printf "<%s>" "${a[@]:+alt}"; echo; printf "<%s>" "${a[@]-d}"; echo; set --; printf "<%s>" "${@-d}"; echo`, "<>\n<d>\n<d>\n"},
+	{`a=(1 2); printf "<%s>" "${a[@]:+alt}"; echo; printf "<%s>" "${a[@]-d}" "${a[@]:-d}"; echo`, "<alt>\n<1><2><1><2>\n"},
+	{`a=(""); printf "<%s>" "${a[@]-d}" "${a[@]:-d}" "${a[@]:+s}" "${a[@]+s}"; echo`, "<><d><><s>\n"},
+	{`a=("" ""); printf "<%s>" "${a[@]:+s}" "${a[*]:+s}"; echo`, "<s><s>\n"},
+	{`declare -a a; printf "<%s>" "${a[@]-d}" "${a[@]+s}"; echo`, "<d>\n"},
+	{`a=(); echo ${a[@]-d} ${a[*]:-e}; set --; echo ${@-f} ${*:-g}`, "d e\nf g\n"},
+	{
+		`a=(); echo "${a[@]:?err}"; echo after`,
+		"a: err\nexit status 1 #JUSTERR",
+	},
+
+	// operators resulting in a word which holds a list
+	{`a=(a "b c"); printf "<%s>" "${a[@]+"${a[@]}"}" "${a[@]:+${a[@]}}" "${a[*]+"${a[@]}"}"; echo`, "<a><b c><a><b c><a><b c>\n"},
+	{`set -- a "b c"; printf "<%s>" "${@+"$@"}" "${u-$@}" "${u:-"$@"}"; echo`, "<a><b c><a><b c><a><b c>\n"},
+	{`a=(1 2); printf "<%s>" "${a[@]+x y}" "${a[@]+p"${a[@]}"s}" "p${u-"${a[@]}"}s"; echo`, "<x y><p1><2s><p1><2s>\n"},
+	{`set -- 1 2; printf "<%s>" "${u-$*}" "${u-"$*"}"; echo`, "<1 2><1 2>\n"},
+	// Unlike a list of its own, an empty list in a word still produces a field.
+	{`set --; a=(1); printf "<%s>" "${a[@]+"$@"}" "${u-"$@"}" "${u-$@}"; echo`, "<><><>\n"},
+	// The subscript of an element is evaluated once.
+	{`a=(x y z); i=0; echo "${a[i++]-d}" $i; j=0; echo "${a[j++]:+s}" $j`, "x 1\ns 1\n"},
+
+	// operators transforming each element of a list
+	{`a=(ab cd); printf "<%s>" "${a[@]@U}" "${a[@]@u}" "${a[@]@L}" "${a[@]@E}"; echo`, "<AB><CD><Ab><Cd><ab><cd><ab><cd>\n"},
+	{`a=(a b); printf "<%s>" "${a[@]@Q}"; echo`, "<a><b>\n #IGNORE bash quotes the values"},
+	{`a=(x y); echo "${a[@]@a}" "${a[*]@a}"; declare -Ar m=([k]=v); echo "${m[@]@a}"`, "a a a a\nAr\n"},
+
+	// Unquoted backslashes are removed from assignment values and
+	// other words which do not undergo field splitting.
+	{`x=a\ b; echo "$x"; x=\$y; echo "$x"; echo "${u-\$y}"; x=a\\b; echo "$x"; x=\"q\"; echo "$x"`, "a b\n$y\n$y\na\\b\n\"q\"\n"},
+	{`f() { local x=a\ b; echo "$x"; }; f; a=([0]=x\ y); echo "${a[0]}"; x=a\*b; echo "$x"`, "a b\nx y\na*b\n"},
+	{`case a\ b in "a b") echo yes;; esac; [[ a\ b == "a b" ]] && echo yes2; cat <<< a\ b`, "yes\nyes2\na b\n"},
+	{`echo hi > a\ b; [[ -e "a b" ]] && cat "a b"`, "hi\n"},
+	{`[[ x == \* ]] && echo m1; [[ \* == \* ]] && echo m2; case x in \*) echo m3;; esac; case "*" in \*) echo m4;; esac`, "m2\nm4\n"},
+	// Within double quotes or a here-document, an operand like ${x:-word}
+	// follows the rules of double quotes, and quoted pattern characters
+	// match literally.
+	{`echo "${x:-a\b}" "${x:-a\$b}" "${x:-a\"b}" ${x:-a\b}; a=(); echo "${a[@]:-a\b}"`, "a\\b a$b a\"b ab\na\\b\n"},
+	{"cat <<EOF\n${x:-a\\b} ${x:-a\\$b}\nEOF", "a\\b a$b\n"},
+	{`y='a*b'; echo ${y#a\*} ${y#"a*"} "${y#a\*}" ${y%\*b}; p='a*'; echo "${y#"$p"}"`, "b b b a\nb\n"},
+	// Backslashes within expanded values are kept.
+	{`x='a\b'; [ "$x" = ab ] && echo m1; [ ab = "$x" ] && echo m2; [ "$x" != ab ] && echo m3; test "$x" = 'a\b' && echo m4`, "m3\nm4\n"},
+	{`v='y=a\b'; declare "$v"; echo "$y"; f() { local "$v"; echo "$y"; }; f; export "$v"; echo "$y"`, "a\\b\na\\b\na\\b\n"},
+
 	// weird assignments
 	{"a=b; a=(c d); echo ${a[@]}", "c d\n"},
 	{"a=(b c); a=d; echo ${a[@]}", "d c\n"},
@@ -3571,6 +3817,47 @@ done <<< 2`,
 	{`a=(x "" y); echo ${!a[@]}; echo "${!a[@]}"`, "0 1 2\n0 1 2\n"},
 	{"a=(0 1 2 3 4 5 6 7 8 9 10); echo ${!a[@]}", "0 1 2 3 4 5 6 7 8 9 10\n"},
 	{"i=3; declare -A a=(['x']=b); a[i]=x; for e in ${!a[@]}; do echo $e; done | sort", "i\nx\n"},
+	// Assignments take the existing kind of the variable and the
+	// subscript into account.
+	{"x=1; x+=; echo \"[$x]\"", "[1]\n"},
+	{"a=(x y); a[1]+=Q; echo ${a[@]}", "x yQ\n"},
+	{"a=(1 2 3); a[-1]+=x; echo ${a[@]}", "1 2 3x\n"},
+	{"a=(1 2); a=; declare -p a", "declare -a a=([0]=\"\" [1]=\"2\")\n"},
+	{"a=([1]=x); a+=; declare -p a", "declare -a a=([0]=\"\" [1]=\"x\")\n"},
+	{"s=x; s+=(y); declare -p s", "declare -a s=([0]=\"x\" [1]=\"y\")\n"},
+	{"declare -a x=1; declare -p x", "declare -a x=([0]=\"1\")\n"},
+	{"declare -A x=1; declare -p x", "declare -A x=([0]=\"1\")\n #IGNORE bash prints a trailing space"},
+	{"declare a[2]=x; declare -p a", "declare -a a=([2]=\"x\")\n"},
+	{"x=1; declare -A x; declare -p x", "declare -A x=([0]=\"1\")\n #IGNORE bash prints a trailing space"},
+	{"declare -A A=([k]=v); A[k]+=w; echo ${A[k]}", "vw\n"},
+	{"declare -A A=([k]=v); A+=([j]=1); echo ${A[j]}${A[k]}", "1v\n"},
+	{"declare -A A=([k]=v); A+=x; echo ${A[0]}${A[k]}", "xv\n"},
+	{"declare -A A=([k]=v); A=x; echo ${A[0]}${A[k]}", "xv\n"},
+	{"declare -A m; m=([foo]=1 [bar]=2); echo ${m[foo]} ${m[bar]}", "1 2\n"},
+	{"declare -A A; A=(a 1 b); echo ${A[b]-unset}", "\n"},
+	{
+		"a=(1 2); declare -A a; echo st=$?; declare -p a",
+		"declare: a: cannot convert indexed to associative array\nst=1\ndeclare -a a=([0]=\"1\" [1]=\"2\")\n #JUSTERR",
+	},
+	{
+		"declare -A m=([k]=v); declare -a m; echo st=$?; declare -p m",
+		"declare: m: cannot convert associative to indexed array\nst=1\ndeclare -A m=([k]=\"v\")\n #JUSTERR",
+	},
+	{
+		"a=(1); a[-5]=x; echo after",
+		"a[-5]: bad array subscript\nexit status 1 #JUSTERR",
+	},
+	{
+		"declare -A A; A=([k]=v w); echo after",
+		"A: w: must use subscript when assigning associative array\nexit status 1 #JUSTERR",
+	},
+	// A subshell modifies a copy of an array.
+	{"a=(x y); (a+=Z); echo ${a[@]}", "x y\n"},
+	{"a=(x y); (a[0]+=Z); echo ${a[@]}", "x y\n"},
+	{"declare -A A=([k]=v); (A[k]+=w); echo ${A[k]}", "v\n"},
+	// A prefix assignment starts from the string value.
+	{"x=1; x+=2 $ENV_PROG | grep '^x='; echo $x", "x=12\n1\n"},
+	{"a=(1 2); a=x $ENV_PROG | grep '^a='; echo ${a[@]}", "a=x\n1 2\n"},
 
 	// sparse indexed arrays
 	{"a[5]=x; echo ${#a[@]} ${a[@]} ${!a[@]}", "1 x 5\n"},
@@ -3633,6 +3920,10 @@ done <<< 2`,
 	{"a='x=b y=c'; declare $a; echo $x $y", "b c\n"},
 	{"declare =bar", "declare: invalid name \"\"\nexit status 1 #JUSTERR"},
 	{"declare $unset=$unset", "declare: invalid name \"\"\nexit status 1 #JUSTERR"},
+	// Flags are only parsed before the first name, and other names are
+	// still declared after an invalid one.
+	{`declare x=1 -r z=3; echo "$? $x $z"; x=2; echo $x`, "declare: invalid name \"-r\"\n1 1 3\n2\n #JUSTERR"},
+	{`v=1y=2; declare -x a=1 "$v" -r b=2; echo $?; declare -p a b`, "declare: invalid name \"1y\"\ndeclare: invalid name \"-r\"\n1\ndeclare -x a=\"1\"\ndeclare -x b=\"2\"\n #JUSTERR"},
 
 	// export
 	{"declare foo=bar; $ENV_PROG | grep '^foo='", "exit status 1"},
@@ -3845,6 +4136,31 @@ done <<< 2`,
 		"declare -n foo=bar; foo=value $ENV_PROG | grep '^bar='",
 		"bar=value\n",
 	},
+	// Namerefs are followed on every path which reads or writes a variable.
+	{"g() { local -n r=$1; r=v; }; f() { local x=l; g x; echo $x; }; f", "v\n"},
+	{"arr=(x y z); declare -n r=arr; r[2]=Z; echo \"${arr[@]}\"", "x y Z\n"},
+	{"a=3; declare -n r=a; echo $((r+1)); ((r++)); echo $a", "4\n4\n"},
+	{"declare -n r=x; x=1; read r <<< 7; echo $x; mapfile -t r <<< 8; echo ${x[@]}", "7\n8\n"},
+	// A for loop makes a nameref refer to each word in turn.
+	{`a=1 b=2 x=0; declare -n r=x; for r in a b; do echo "$r"; done; declare -p r x`, "1\n2\ndeclare -n r=\"b\"\ndeclare -- x=\"0\"\n"},
+	{"declare -n r=x; x=1; unset r; echo \"[${x-unset}] [${r-unset}]\"; declare -p r", "[unset] [unset]\ndeclare -n r=\"x\"\n"},
+	{"declare -n r=x; x=1; unset -n r; echo \"[${x-unset}] [${r-unset}]\"", "[1] [unset]\n"},
+	{
+		"declare -n r=x; x=1; readonly r; x=2; echo after",
+		"x: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"declare -n r=r; echo st=$?",
+		"declare: r: nameref variable self references not allowed\nst=1\n #JUSTERR",
+	},
+	{
+		"declare -n r='a b'; echo st=$?",
+		"declare: `a b': invalid variable name for name reference\nst=1\n #JUSTERR",
+	},
+	{
+		"declare -n r; declare -n r='a b'; echo st=$?",
+		"declare: `a b': invalid variable name for name reference\nst=1\n #JUSTERR",
+	},
 	{
 		"echo ${!@}-${!*}; set -- foo; echo ${!@}-${!*}-${!1}; foo=value; echo ${!@}-${!*}-${!1}",
 		"-\n--\nvalue-value-value\n",
@@ -3853,6 +4169,71 @@ done <<< 2`,
 		"declare -n ref=arr; ref+=(x y); echo ${ref[@]} ${arr[@]}",
 		"x y x y\n",
 	},
+	// Operators apply to the parameter named by an indirect expansion.
+	{`n=x; echo "${!n:-d}"; x=abc; echo "${!n#a}" "${!n^^}" "${!n/b/X}" "${!n:1}" "${!n:+y}"`, "d\nbc ABC aXc bc y\n"},
+	{`n=x; x=abc; echo "${!n@Q}" "${!n@U}"`, "abc ABC\n #IGNORE bash quotes the value"},
+	{`n=x; echo ${!n=z}; echo $x`, "z\nz\n"},
+	{`set -u; n=u; echo "${!n:-d}"`, "d\n"},
+	{
+		`x=abc; n=x; echo "${!n:?err}"; unset x; echo "${!n:?err}"`,
+		"abc\nn: err\nexit status 1 #JUSTERR",
+	},
+	{
+		`unset n; echo "${!n:-d}"; echo after`,
+		"n: invalid indirect expansion\nexit status 1 #JUSTERR",
+	},
+	{
+		`n=""; echo "${!n}"; echo after`,
+		": invalid variable name\nexit status 1 #JUSTERR",
+	},
+	{
+		`n="a b"; echo "${!n}"; echo after`,
+		"a b: invalid variable name\nexit status 1 #JUSTERR",
+	},
+	// An indirect expansion may name an array element or a list.
+	{`a=(p q); n="a[1]"; echo "${!n}"; n="a[@]"; printf "<%s>" "${!n}" "${!n@U}"; echo`, "q\n<p><q><P><Q>\n"},
+	{`declare -A A=([k]=v); n="A[k]"; echo "${!n}"; n="A[@]"; echo "${!n}"`, "v\nv\n"},
+	{`set -- s t; n=@; printf "<%s>" "${!n}"; echo; n="*"; printf "<%s>" "${!n}"; echo; n=2; echo "${!n}"`, "<s><t>\n<s t>\nt\n"},
+	{`set --; echo "[${!1}]" "[${!@}]"`, "[] []\n"},
+	{`x=1; n=x; echo "${!n[@]}" "${!n[0]}"`, "0 1\n"},
+	{`n=x; declare -n x=y; y=v; echo "${!n}"`, "v\n"},
+	{`declare -n r=y; y=v; echo "${!r}" "${!r:-d}"`, "y y\n"},
+	{`n=LINENO; echo ${!n}`, "1\n"},
+	// A nameref declared without a target gets one from its first assignment.
+	{`declare -n ref; ref=x; x=5; echo "${!ref} $ref"; declare -p ref`, "x 5\ndeclare -n ref=\"x\"\n"},
+	{`f() { local -n ref; ref=$1; ref=9; }; f x; echo "[$x]"`, "[9]\n"},
+	// Like an assignment, read and getopts set its target.
+	{`x=0; declare -n r; read r <<< x; r=5; echo $x; declare -n q; getopts a q -a; declare -p q`, "5\ndeclare -n q=\"a\"\n"},
+	// Setting the target of a nameref checks that it is a valid name.
+	{
+		"declare -n r=x; for r in 'bad name' b; do echo in; done; echo st=$?; declare -p r",
+		"`bad name': not a valid identifier\nst=1\ndeclare -n r=\"x\"\n #JUSTERR",
+	},
+	{
+		"declare -n r=x; for r in r b; do echo in; done; echo st=$?; declare -p r",
+		"r: nameref variable self references not allowed\nst=1\ndeclare -n r=\"x\"\n #JUSTERR",
+	},
+	{
+		"declare -n r; read r <<< 'bad name'; echo st=$?; declare -p r",
+		"`bad name': not a valid identifier\nst=1\ndeclare -n r\n #JUSTERR",
+	},
+	{
+		"declare -n r\nr='bad name'; echo same\ndeclare -p r",
+		"`bad name': not a valid identifier\ndeclare -n r\n #JUSTERR",
+	},
+	{
+		"a=(x y); declare -n r s\nr='a[1]'; echo same\nr=z; echo \"<$r>\"; declare -p a\nfor s in 'a[0]'; do echo \"<$s>\"; done; echo st=$?",
+		"a[1]: invalid variable name for name reference\n<>\ndeclare -a a=([0]=\"x\" [1]=\"y\")\na[0]: invalid variable name for name reference\nst=1\n #IGNORE namerefs to array elements are not supported",
+	},
+	// The subscript of an indirect expansion is an associative key or an
+	// arithmetic expression, depending on the array.
+	{`declare -A a=(["foo bar"]=1); n="a[foo bar]"; echo "${!n}"; b=(x y); n="b[1+1-1]"; echo "${!n}"; n="b[@]"; echo "${!n}"`, "1\ny\nx y\n"},
+	{
+		`b=(x y); n="b[1+]"; echo "${!n}"; echo after`,
+		"b[1+]: bad array subscript\nexit status 1 #JUSTERR",
+	},
+	// The subscript of an indirect expansion is evaluated once.
+	{`a=(x y); x=1; y=2; i=0; echo ${!a[i++]} $i; printf "<%s>" "${!a[i++]}"; echo " $i"; j=0; echo "${!a[j++]:-d}" $j`, "1 1\n<2> 2\n1 1\n"},
 
 	// read-only vars
 	{"declare -r foo=bar; echo $foo", "bar\n"},
@@ -3869,7 +4250,7 @@ done <<< 2`,
 	},
 	{
 		"declare -r foo=bar; export foo=",
-		"foo: readonly variable\nexit status 1 #JUSTERR",
+		"export: foo: readonly variable\nexit status 1 #JUSTERR",
 	},
 	{
 		"readonly foo=bar; foo=etc",
@@ -3896,6 +4277,156 @@ done <<< 2`,
 	{
 		"declare -r -x foo=bar; foo=x",
 		"foo: readonly variable\nexit status 1 #JUSTERR",
+	},
+	// Builtins which fail to set a variable fail too.
+	{
+		"readonly i=0; unset i; echo st=$?",
+		"i: readonly variable\nst=1\n #JUSTERR",
+	},
+	{
+		"readonly i=0; read i <<< x; echo st=$?",
+		"i: readonly variable\nst=1\n #JUSTERR",
+	},
+	{
+		"readonly i=0; read -a i <<< x; echo st=$?",
+		"i: readonly variable\nst=1\n #JUSTERR",
+	},
+	{
+		"readonly i=0; mapfile i <<< x; echo st=$?",
+		"i: readonly variable\nst=1\n #JUSTERR",
+	},
+	{
+		"readonly i=0; getopts a i -a; echo st=$?",
+		"i: readonly variable\nst=2\n #JUSTERR",
+	},
+	{
+		"readonly i=0; for i in 1 2; do echo body $i; done; echo st=$?",
+		"i: readonly variable\nst=1\n #JUSTERR",
+	},
+	{
+		"a=(1 2); unset 'a[-5]'; echo st=$?",
+		"unset: a[-5]: bad array subscript\nst=1\n #JUSTERR",
+	},
+	{
+		"s=1; unset 's[1]'; echo st=$?",
+		"unset: s: not an array variable\nst=1\n #JUSTERR",
+	},
+	// An assignment error abandons the rest of the line, unlike a
+	// failing builtin or arithmetic command.
+	{
+		"readonly i=0; i=1; echo after",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly i=0; i+=1; echo after",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly a=(1); a[0]=2; echo after",
+		"a: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly i=0; i=1 || echo no; echo after",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"f() { readonly i=0; i=1; echo in f; }; f; echo after",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"(readonly i=0; i=1; echo inner); echo after",
+		"i: readonly variable\nafter\n #JUSTERR",
+	},
+	{
+		"trap 'echo trap' EXIT; readonly i=0; i=1; echo after",
+		"i: readonly variable\ntrap\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly i; echo ${i=3}; echo after",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly i; echo $((i=3)); echo after",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly i; ((i=3)); echo after",
+		"i: readonly variable\nafter\n #JUSTERR",
+	},
+	{
+		"readonly i; let i=3; echo after",
+		"i: readonly variable\nafter\n #JUSTERR",
+	},
+	// The script then carries on with the next line.
+	{
+		"readonly i=0\ni=1; echo same\necho after $?",
+		"i: readonly variable\nafter 1\n #JUSTERR",
+	},
+	{
+		"readonly i=0\nf() { i=1; echo in f; }\nf || echo no; echo same\necho after",
+		"i: readonly variable\nafter\n #JUSTERR",
+	},
+	{
+		"readonly i=0\n{ i=1\necho same\n}; echo same\necho after",
+		"i: readonly variable\nafter\n #JUSTERR",
+	},
+	{
+		"readonly i=0\neval 'i=1; echo same\necho next'; echo after",
+		"i: readonly variable\nnext\nafter\n #JUSTERR",
+	},
+	{
+		"readonly i\necho ${i=3}; echo same\necho $((i=3)); echo same\necho after",
+		"i: readonly variable\ni: readonly variable\nafter\n #JUSTERR",
+	},
+	{
+		"x=08\necho $((x)); echo same\necho after",
+		"08: value too great for base\nafter\n #JUSTERR",
+	},
+	// Any error in an array subscript abandons the rest of the line,
+	// even in an arithmetic command, without modifying the array.
+	{
+		"a=(1 2)\na[08]=5; echo same\nx=1+\n{ a[x]=5; echo same; }\necho after; declare -p a",
+		"08: value too great for base\n1+: arithmetic syntax error in expression\nafter\ndeclare -a a=([0]=\"1\" [1]=\"2\")\n #JUSTERR",
+	},
+	{
+		"a=(1 2)\nunset 'a[08]'; echo same\ndeclare a[08]=5; echo same\na+=([1/0]=3); echo same\necho after; declare -p a",
+		"08: value too great for base\n08: value too great for base\ndivision by zero\nafter\ndeclare -a a=([0]=\"1\" [1]=\"2\")\n #JUSTERR",
+	},
+	{
+		"a=(1 2)\n((a[08] = 3)); echo same\nlet 'a[1/0] = 3' b=4; echo same\n((a[1/0])); echo same\necho ${a[1/0]}; echo same\necho after $b; declare -p a",
+		"08: value too great for base\ndivision by zero\ndivision by zero\ndivision by zero\nafter\ndeclare -a a=([0]=\"1\" [1]=\"2\")\n #JUSTERR",
+	},
+	{
+		"exec 2>/dev/null; a=(1 2)\na[08]=5; echo same\n((a[1/0] = 3)); echo same\necho after $?; declare -p a",
+		"after 1\ndeclare -a a=([0]=\"1\" [1]=\"2\")\n",
+	},
+	{
+		"exec 2>/dev/null; a=(1)\ndeclare a[1/0]=x c=2; echo same\necho ${c-unset}",
+		"unset\n",
+	},
+	{
+		"readonly i=0; trap 'echo err' ERR\ni=1\nfalse\necho after",
+		"i: readonly variable\nerr\nafter\n #JUSTERR",
+	},
+	{
+		"set -e; readonly i=0\ni=1 || echo no\necho after",
+		"i: readonly variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"((z=${q:?boom})); echo after",
+		"q: boom\nexit status 1 #JUSTERR",
+	},
+	{
+		"set -u; let x=$y+1; echo after",
+		"y: unbound variable\nexit status 1 #JUSTERR",
+	},
+	{
+		"q=1bad; for ((i=${!q}; i<1; i++)); do :; done; echo after",
+		"1bad: invalid variable name\nexit status 1 #JUSTERR",
+	},
+	{
+		"readonly i=0; declare i=2; echo st=$?",
+		"declare: i: readonly variable\nst=1\n #JUSTERR",
 	},
 
 	// globbing
@@ -4175,6 +4706,9 @@ done <<< 2`,
 	{"echo a{à,世界}", "aà a世界\n"},
 	{"echo a{b,c}d{e,f}g", "abdeg abdfg acdeg acdfg\n"},
 	{"echo a{b{x,y},c}d", "abxd abyd acd\n"},
+	{"echo {foo},1} {a},b} {{a}},b} {a..},b}", "foo} 1 a} b {a}} b a..} b\n"},
+	{"echo x{a},b} {x{a},b} x{},a} {},a}", "xa} xb x{a} b x} xa {},a}\n"},
+	{`x=v; echo {$x},a} {"}",a}`, "v} a } a\n"},
 	{"echo a{1..", "a{1..\n"},
 	{
 		"echo {00..2}; echo {01..10}; echo {1..10..-2}; echo {10..1..2}; echo {-03..3}",
@@ -4183,6 +4717,7 @@ done <<< 2`,
 	{"echo a{1..2}b{4..5}c", "a1b4c a1b5c a2b4c a2b5c\n"},
 	{"echo a{c..f}", "ac ad ae af\n"},
 	{"echo a{4..1..1}", "a4 a3 a2 a1\n"},
+	{"echo {1..2{a,b}} {x..2{a,b}} {a.{x,y}..b}", "{1..2{a,b}} {x..2a} {x..2b} {a.{x,y}..b}\n"},
 	{"b=c; echo ${b}a{4..1..1}", "ca4 ca3 ca2 ca1\n"},
 	{"b=c; echo a{1,2}$b", "a1c a2c\n"},
 	{"echo a{1,2}'bc'", "a1bc a2bc\n"},
@@ -4339,6 +4874,24 @@ done <<< 2`,
 		"read -r a b <<< '1\\\t2'; echo $a; echo $b;",
 		"1\\\n2\n",
 	},
+	// Every command of a pipeline runs in a subshell, unless lastpipe is set.
+	{"n=0; printf 'a\\nb\\n' | while read l; do n=$((n+1)); done; echo $n", "0\n"},
+	{"n=0; shopt -s lastpipe; printf 'a\\nb\\n' | while read l; do n=$((n+1)); done; echo $n", "2\n"},
+	{"echo | exit 3; echo after $?", "after 3\n"},
+	{"shopt -s lastpipe; echo | exit 3; echo after", "exit status 3"},
+	{"echo foo | read; echo \"[$REPLY]\"; shopt -s lastpipe; echo foo | read; echo \"[$REPLY]\"", "[]\n[foo]\n"},
+	// Functions and aliases changed by a subshell do not affect its parent.
+	{"fn() { echo a; }; (fn() { echo b; }; fn); fn; echo | { fn() { echo c; }; fn; }; fn; x=$(unset -f fn; type fn >/dev/null 2>&1 || echo d); echo $x; fn", "b\na\nc\na\nd\na\n"},
+	{"shopt -s expand_aliases; alias g='echo a'\n(alias g='echo b'; unalias g; alias h='echo c')\ng; alias", "a\nalias g='echo a'\n"},
+	{"f() { echo | x=1; echo \"[$x]\"; }; f; echo \"[$x]\"", "[]\n[]\n"},
+	{"f() { echo | return 3; echo after; }; f; echo st=$?", "after\nst=0\n"},
+	// A simple command keeps the enclosing loop, ending only its subshell.
+	{`for i in 1 2; do true | break; break | cat; true | true | continue; echo $i; done`, "1\n2\n"},
+	// Background jobs started by the last command are not the shell's.
+	{`true & p=$!; echo | { false & }; [ "$p" = "$!" ] && echo same; wait $!; echo st=$?`, "same\nst=0\n"},
+	{"f() { (return 3); echo after; }; f; echo st=$?", "after\nst=0\n"},
+	{"f() { local x=1; (local x; echo \"[$x]\"); }; f", "[1]\n"},
+	{"set -o pipefail; echo | false; echo $?; false | echo; echo $?", "1\n\n1\n"},
 	{
 		"echo line\\\ncontinuation | while read a; do echo $a; done",
 		"linecontinuation\n",
@@ -4400,6 +4953,18 @@ done <<< 2`,
 		`IFS=: read x <<< ':a:b:'; echo "[$x]"`,
 		"[:a:b:]\n",
 	},
+	// A non-whitespace IFS character delimits empty fields, and the last
+	// name takes the rest of the line unless it holds a single word.
+	{`IFS=: read a b c <<< 'x::y'; echo "[$a][$b][$c]"`, "[x][][y]\n"},
+	{`IFS=: read a b <<< 'x:y:z:'; echo "[$a][$b]"`, "[x][y:z:]\n"},
+	{`IFS=: read a b <<< 'x:y:'; echo "[$a][$b]"; IFS=: read a b <<< 'x:y::'; echo "[$a][$b]"`, "[x][y]\n[x][y::]\n"},
+	{`IFS=: read a b <<< 'x::'; echo "[$a][$b]"; IFS=: read a b <<< ':x'; echo "[$a][$b]"`, "[x][]\n[][x]\n"},
+	{`IFS=: read a b c <<< 'x:y::'; echo "[$a][$b][$c]"; IFS=: read a <<< 'x::'; echo "[$a]"`, "[x][y][]\n[x::]\n"},
+	{`IFS=, read -a arr <<< 'a,,b,'; echo ${#arr[@]}; IFS=: read -a arr <<< 'a::b::'; echo ${#arr[@]}`, "3\n4\n"},
+	{`IFS=' :' read a b c <<< ' a : b : c '; echo "[$a][$b][$c]"`, "[a][b][c]\n"},
+	{`IFS=': ' read a b <<< 'x :: y'; echo "[$a][$b]"; IFS=': ' read a b <<< 'x : y : '; echo "[$a][$b]"`, "[x][: y]\n[x][y]\n"},
+	{`IFS=': ' read -a arr <<< '  x : : y  '; echo ${#arr[@]} "${arr[@]}"`, "3 x  y\n"},
+	{`IFS=: read a b <<< 'x\:y:z'; echo "[$a][$b]"; IFS=: read -r a b <<< 'x\:y:z'; echo "[$a][$b]"`, "[x:y][z]\n[x\\][y:z]\n"},
 	{
 		`read <<< '  a \b  '; echo "[$REPLY]"; read -r <<< ' a\b '; echo "[$REPLY]"`,
 		"[  a b  ]\n[ a\\b ]\n",
@@ -4701,7 +5266,7 @@ var runTestsUnix = []runTest{
 	},
 	{
 		`unset UID`,
-		"UID: readonly variable\n #IGNORE",
+		"UID: readonly variable\nexit status 1 #JUSTERR",
 	},
 	{
 		`test -n "$EUID" && echo OK`,
@@ -4713,12 +5278,12 @@ var runTestsUnix = []runTest{
 	},
 	{
 		`unset EUID`,
-		"EUID: readonly variable\n #IGNORE",
+		"EUID: readonly variable\nexit status 1 #JUSTERR",
 	},
 	// GID is not set in bash
 	{
 		`unset GID`,
-		"GID: readonly variable\n #IGNORE",
+		"GID: readonly variable\nexit status 1 #IGNORE bash has no GID variable",
 	},
 	{
 		`[[ -z $GID ]] && echo "GID not set"`,
@@ -4932,9 +5497,8 @@ hello otter
 		"+ set +x\nhi\n",
 	},
 	{
-		// TODO: bash prints `a[1]=z`, including the subscript.
 		`set -x; a=(x y); a[1]=z`,
-		"+ a=(x y)\n+ a=z\n #IGNORE",
+		"+ a=(x y)\n+ a[1]=z\n",
 	},
 	{
 		// TODO: bash prints `a+=bar`, that is, the value being appended
@@ -5102,6 +5666,9 @@ var runTestsWindows = []runTest{
 // These tests are specific to 64-bit architectures, and that's fine. We don't
 // need to add explicit versions for 32-bit.
 var runTests64bit = []runTest{
+	// Numbers wrap around like in Bash.
+	{"echo $((9223372036854775808)) $((18446744073709551617)) $((-9223372036854775809)) $((0xFFFFFFFFFFFFFFFF))", "-9223372036854775808 1 9223372036854775807 -1\n"},
+	{"x=99999999999999999999; echo $((x)) $((36#ZZZZZZZZZZZZZZ))", "7766279631452241919 -1823562080465190913\n"},
 	{"printf %i,%u -3 -3", "-3,18446744073709551613"},
 	{"printf %o -3", "1777777777777777777775"},
 	{"printf %x -3", "fffffffffffffffd"},
@@ -5212,10 +5779,15 @@ func TestRunnerUnsupported(t *testing.T) {
 		{syntax.LangZsh, `echo "${}"`, "unsupported\n"},
 		{syntax.LangZsh, "echo ${:-foo}", "unsupported\n"},
 		{syntax.LangZsh, "echo ${+a}", "unsupported\n"},
-		{syntax.LangZsh, "a=abc; echo ${a[(r)b]}", "unsupported\n"},
+		{syntax.LangZsh, "a=abc; echo ${a[(r)b]}", "unsupported\nexit status 1"},
+		{syntax.LangZsh, "echo $(( abs(-5) ))", "unsupported\nexit status 1"},
+		{syntax.LangZsh, "(( abs(-5) ))", "unsupported\nexit status 1"},
+		{syntax.LangZsh, "a=(abc); echo ${a[1][2]}", "unsupported\n"},
 		{syntax.LangZsh, "() { echo anon; }", "unsupported\nexit status 1"},
 		{syntax.LangZsh, "function { echo anon; }", "unsupported\nexit status 1"},
+		{syntax.LangZsh, "() { echo $1; } a b", "unsupported\nexit status 1"},
 		{syntax.LangZsh, "function f g { echo multi; }", "unsupported\nexit status 1"},
+		{syntax.LangZsh, "for a b in 1 2; do echo $a $b; done", "unsupported\nexit status 1"},
 		{syntax.LangZsh, "cat =(echo hi)", "unsupported\n"},
 		{syntax.LangMirBSDKorn, "echo ${%a}", "unsupported\n"},
 	}

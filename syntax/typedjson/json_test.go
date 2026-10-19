@@ -47,12 +47,13 @@ func TestRoundtripZsh(t *testing.T) {
 var allNodeNames = []string{
 	"ArithmCmd", "ArithmExp", "ArrayElem", "ArrayExpr", "Assign",
 	"BinaryArithm", "BinaryCmd", "BinaryTest", "Block", "BraceExp",
-	"CStyleLoop", "CallExpr", "CaseClause", "CaseItem", "CmdSubst", "Comment",
-	"CoprocClause", "DblQuoted", "DeclClause", "ExtGlob", "File", "FlagsArithm",
-	"ForClause", "FuncDecl", "IfClause", "LetClause", "Lit", "ParamExp",
-	"ParenArithm", "ParenTest", "ProcSubst", "Redirect", "SglQuoted", "Stmt",
-	"Subshell", "TestClause", "TestDecl", "TimeClause", "UnaryArithm",
-	"UnaryTest", "WhileClause", "Word", "WordIter",
+	"CStyleLoop", "CallArithm", "CallExpr", "CaseClause", "CaseItem",
+	"CmdSubst", "Comment", "CoprocClause", "DblQuoted", "DeclClause",
+	"ExtGlob", "File", "FlagsArithm", "ForClause", "FuncDecl", "IfClause",
+	"LetClause", "Lit", "ParamExp", "ParenArithm", "ParenTest", "ProcSubst",
+	"Redirect", "SglQuoted", "Stmt", "Subshell", "TestClause", "TestDecl",
+	"TimeClause", "UnaryArithm", "UnaryTest", "WhileClause", "Word",
+	"WordIter",
 }
 
 // TestRoundtripAnyNode checks that any node can be encoded and decoded,
@@ -86,8 +87,9 @@ coproc foo
 [[ ! (foo && -n bar) ]]
 # comment
 `},
-		// ${a[(r)foo]} produces a FlagsArithm node, which only appears with zsh.
-		{syntax.LangZsh, "echo ${a[(r)foo]}\n"},
+		// FlagsArithm, CallArithm, multiple subscripts, multi-name for loops,
+		// and anonymous functions with arguments only appear with zsh.
+		{syntax.LangZsh, "echo ${a[(r)foo]} ${a[1][(r)b]} $((abs(-1)))\nfor a b in x y; do foo; done\n() { echo $1; } a b\n"},
 		// TestDecl only appears with bats.
 		{syntax.LangBats, "@test \"name\" {\n\tfoo\n}\n"},
 	}

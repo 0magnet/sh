@@ -1148,6 +1148,26 @@ var errorCases = []errorCase{
 		flipConfirmAll, // note that we don't backtrack
 	),
 	errCase(
+		"echo $((abs (1)))",
+		langErr("1:13: not a valid arithmetic operator: `(`", LangZsh),
+	),
+	errCase(
+		"echo $((f(,1)))",
+		langErr("1:10: `(` must be followed by an expression", LangZsh),
+	),
+	errCase(
+		"echo $((f(1,)))",
+		langErr("1:12: `,` must be followed by an expression", LangZsh),
+	),
+	errCase(
+		"echo $((f(1 2)))",
+		langErr("1:10: reached LitWord without matching `(` with `)`", LangZsh),
+	),
+	errCase(
+		"echo $((f(1",
+		langErr("1:10: reached EOF without matching `(` with `)`", LangZsh),
+	),
+	errCase(
 		"echo $((a *))",
 		langErr("1:11: `*` must be followed by an expression"),
 	),
@@ -1756,6 +1776,11 @@ var errorCases = []errorCase{
 	),
 	errCase(
 		"a[2]=x foo",
+		langErr("1:1: inline variables cannot be arrays", LangBash|LangZsh),
+		flipConfirmAll, // stringifies
+	),
+	errCase(
+		"a=(x y) local foo",
 		langErr("1:1: inline variables cannot be arrays", LangBash|LangZsh),
 		flipConfirmAll, // stringifies
 	),
@@ -2446,13 +2471,19 @@ func TestParseArithmetic(t *testing.T) {
 
 func TestParseArithmeticError(t *testing.T) {
 	t.Parallel()
-	in := "3 +"
-	p := NewParser()
-	_, err := p.Arithmetic(strings.NewReader(in))
-	want := "1:3: `+` must be followed by an expression"
-	got := fmt.Sprintf("%v", err)
-	if got != want {
-		t.Fatalf("Expected %q as an error, but got %q", want, got)
+	tests := []struct {
+		in, want string
+	}{
+		{"3 +", "1:3: `+` must be followed by an expression"},
+		{"3 4", "1:3: unexpected `4` after the arithmetic expression"},
+		{"a)", "1:2: unexpected `)` after the arithmetic expression"},
+	}
+	for _, tc := range tests {
+		t.Run("", func(t *testing.T) {
+			p := NewParser()
+			_, err := p.Arithmetic(strings.NewReader(tc.in))
+			qt.Assert(t, qt.Equals(fmt.Sprintf("%v", err), tc.want))
+		})
 	}
 }
 

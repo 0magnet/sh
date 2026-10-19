@@ -137,7 +137,7 @@ func (bg bgProc) finalExit() exitStatus {
 func (r *Runner) jobList() []*bgProc {
 	var out []*bgProc
 	for _, bg := range r.bgProcs {
-		if bg.disowned || bg.substitution || bg.reaped {
+		if bg.disowned || bg.procSubst || bg.reaped {
 			continue
 		}
 		out = append(out, bg)
@@ -212,7 +212,7 @@ func (r *Runner) jobSpec(spec string) (*bgProc, error) {
 		// job is still found — bash's kill also still reaches a disowned
 		// job's process by PID.
 		for _, bg := range slices.Backward(r.bgProcs) {
-			if !bg.substitution && !bg.reaped && r.bgProcID(bg) == spec {
+			if !bg.procSubst && !bg.reaped && r.bgProcID(bg) == spec {
 				return bg, nil
 			}
 		}

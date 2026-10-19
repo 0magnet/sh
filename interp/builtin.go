@@ -19,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/0magnet/sh/v3/expand"
+	"github.com/0magnet/sh/v3/internal"
 	"github.com/0magnet/sh/v3/syntax"
 )
 
@@ -118,8 +119,6 @@ func IsBuiltin(name string) bool {
 	return false
 }
 
-// TODO: atoi is duplicated in the expand package.
-
 // atoi is like [strconv.ParseInt](s, 10, 64), but it ignores errors and trims whitespace.
 func atoi(s string) int64 {
 	s = strings.TrimSpace(s)
@@ -155,6 +154,13 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 		r.errf(format, args...)
 		exit.code = code
 		return exit
+	}
+	// checkVar fails the builtin after a variable error, which is
+	// already reported; see [Runner.varErr].
+	checkVar := func(err error) {
+		if err != nil {
+			exit.code = 1
+		}
 	}
 	// The builtin and command builtins jump back here to run another builtin,
 	// as recursing could overflow the stack with a long chain of them.
@@ -256,14 +262,16 @@ dispatch:
 		if n < 0 {
 			return failf(1, "shift: %d: shift count out of range\n", n)
 		}
-		if n >= len(r.Params) {
-			r.Params = nil
-		} else {
-			r.Params = r.Params[n:]
+		if n > len(r.Params) {
+			// Like Bash, fail silently and leave the parameters alone.
+			exit.code = 1
+			break
 		}
+		r.Params = r.Params[n:]
 	case "unset":
 		vars := true
 		funcs := true
+		nameref := false
 	unsetOpts:
 		for i, arg := range args {
 			switch arg {
@@ -271,6 +279,8 @@ dispatch:
 				funcs = false
 			case "-f":
 				vars = false
+			case "-n":
+				nameref = true
 			default:
 				args = args[i:]
 				break unsetOpts
@@ -279,10 +289,14 @@ dispatch:
 
 		for _, arg := range args {
 			if name, sub, ok := cutElemSubscript(arg); vars && ok {
-				r.unsetElem(name, sub)
+				checkVar(r.unsetElem(name, sub))
+				if r.stop(ctx) {
+					break // an error in the subscript
+				}
 			} else if vars && r.lookupVar(arg).Declared() {
-				r.delVar(arg)
+				checkVar(r.delVar(arg, nameref))
 			} else if _, ok := r.Funcs[arg]; ok && funcs {
+				r.unshareFuncs()
 				delete(r.Funcs, arg)
 			}
 		}
@@ -415,6 +429,10 @@ dispatch:
 			for _, bg := range r.jobList() {
 				r.reapBgProc(bg)
 			}
+			for _, done := range r.pipeProcSubsts {
+				<-done
+			}
+			r.pipeProcSubsts = nil
 			break
 		}
 		for _, arg := range args {
@@ -550,7 +568,7 @@ dispatch:
 		if !r.enterCall(name, &r.evalDepth) {
 			return r.exit
 		}
-		r.stmts(ctx, file.Stmts)
+		r.scriptStmts(ctx, file.Stmts)
 		r.evalDepth--
 		exit = r.exit
 	case "source", ".":
@@ -596,7 +614,7 @@ dispatch:
 		// parameters.
 		r.sourceSetParams = false
 		r.inSource = true // know that we're inside a sourced script.
-		r.stmts(ctx, file.Stmts)
+		r.scriptStmts(ctx, file.Stmts)
 
 		// If we modified the parameters and the sourced file didn't
 		// explicitly set them, we restore the old ones.
@@ -827,11 +845,12 @@ dispatch:
 			}
 			// Use -1 as max to get all fields without joining the last ones.
 			values := expand.ReadFields(r.ecfg, string(line), -1, raw)
-			r.setVar(arrayName, expand.Variable{
+			arrayName, _ = r.resolveName(arrayName)
+			checkVar(r.setVar(arrayName, expand.Variable{
 				Set:  true,
 				Kind: expand.Indexed,
 				List: values,
-			})
+			}))
 		} else if len(args) == 0 {
 			// Bare "read" assigns the whole line to REPLY without any
 			// trimming, only discarding backslash escapes unless raw.
@@ -849,7 +868,7 @@ dispatch:
 				}
 				val = sb.String()
 			}
-			r.setVarString(shellReplyVar, val)
+			checkVar(r.setVarString(shellReplyVar, val))
 		} else {
 			values := expand.ReadFields(r.ecfg, string(line), len(args), raw)
 			for i, name := range args {
@@ -857,7 +876,7 @@ dispatch:
 				if i < len(values) {
 					val = values[i]
 				}
-				r.setVarString(name, val)
+				checkVar(r.setVarString(name, val))
 			}
 		}
 
@@ -892,8 +911,11 @@ dispatch:
 
 		opt, optarg, done := r.optState.next(optstr, args)
 
-		r.setVarString(name, string(opt))
-		r.delVar("OPTARG")
+		if r.setVarString(name, string(opt)) != nil {
+			exit.code = 2
+			return exit
+		}
+		r.delVar("OPTARG", false)
 		switch {
 		case opt == '?' && diagnostics && !done:
 			r.errf("getopts: illegal option -- %q\n", optarg)
@@ -1023,6 +1045,7 @@ dispatch:
 				words = append(words, w)
 			}
 
+			r.unshareAlias()
 			if r.alias == nil {
 				r.alias = make(map[string]alias)
 			}
@@ -1032,6 +1055,7 @@ dispatch:
 			}
 		}
 	case "unalias":
+		r.unshareAlias()
 		for _, name := range args {
 			delete(r.alias, name)
 		}
@@ -1131,7 +1155,8 @@ dispatch:
 		if err := scanner.Err(); err != nil {
 			return failf(2, "%s: unable to read, %v\n", name, err)
 		}
-		r.setVar(arrayName, vr)
+		arrayName, _ = r.resolveName(arrayName)
+		checkVar(r.setVar(arrayName, vr))
 
 	default:
 		return failf(2, "%s: unsupported builtin\n", name)
@@ -1244,12 +1269,13 @@ func absPath(dir, path string) string {
 	if path == "" {
 		return ""
 	}
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(dir, path)
+	ps := internal.PathsFor(dir)
+	if !ps.IsAbs(path) {
+		path = ps.Join(dir, path)
 	}
 	// Note that [filepath.Join] cleans its result, but an already absolute
 	// path needs cleaning too, such as turning "/a/../b" into "/b".
-	return filepath.Clean(path)
+	return ps.Clean(path)
 }
 
 func (r *Runner) absPath(path string) string {
