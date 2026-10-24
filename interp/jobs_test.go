@@ -173,7 +173,7 @@ func TestKillBuiltin(t *testing.T) {
 		t.Fatalf("kill -0 = %q", s)
 	}
 	// Stopping and continuing need job control, which does not exist here.
-	if s := runSrc(t, "sleep 30 & kill -STOP %1; kill %1; wait"); !strings.Contains(s, "no job control") {
+	if s := runSrc(t, "sleep 30 & kill -STOP %1; kill %1; wait"); !strings.Contains(s, "invalid signal specification") {
 		t.Fatalf("kill -STOP = %q", s)
 	}
 	// Both spellings of the signal reach the job.
@@ -346,7 +346,10 @@ func TestJobsOutliveTheirContext(t *testing.T) {
 	needsSubprocesses(t)
 	t.Parallel()
 	var out syncBuffer
-	r, err := interp.New(interp.Interactive(true), interp.StdIO(strings.NewReader(""), &out, &out))
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
+	r, err := interp.New(interp.Interactive(true), interp.StdIO(strings.NewReader(""), &out, &out),
+		interp.BackgroundContext(bgCtx))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,20 +388,21 @@ func TestJobsOutliveTheirContext(t *testing.T) {
 		t.Fatal("wait did not return when its context was cancelled")
 	}
 
-	// StopJobs is how the embedder ends them when the shell goes away.
+	// Cancelling the background context is how the embedder ends them.
 	out.takeString()
-	r.StopJobs(context.Background())
+	bgCancel()
+	r.WaitBackground()
 	run(context.Background(), "jobs")
 	if s := out.takeString(); strings.Contains(s, "Running") {
-		t.Fatalf("StopJobs left the job running: %q", s)
+		t.Fatalf("cancelling BackgroundContext left the job running: %q", s)
 	}
 }
 
 func TestNonInteractiveJobsDieWithContext(t *testing.T) {
 	needsSubprocesses(t)
 	t.Parallel()
-	// Without Interactive, jobs keep master's behavior: an embedder bounding
-	// a script with a timeout reaps its background children on cancel.
+	// Without BackgroundContext, an embedder bounding a script with a
+	// timeout reaps its background children on cancel.
 	var out syncBuffer
 	r, err := interp.New(interp.StdIO(strings.NewReader(""), &out, &out))
 	if err != nil {
@@ -418,60 +422,5 @@ func TestNonInteractiveJobsDieWithContext(t *testing.T) {
 	run(context.Background(), "wait; jobs")
 	if s := out.String(); strings.Contains(s, "Running") {
 		t.Fatalf("non-interactive job survived its context: %q", s)
-	}
-}
-
-func TestStopJobsSkipsProcessSubstitutions(t *testing.T) {
-	needsSubprocesses(t)
-	if runtime.GOOS == "windows" {
-		t.Skip("no process substitutions on windows")
-	}
-	t.Parallel()
-	// The shells behind process substitutions are not jobs and have no
-	// cancel func; StopJobs must not block on them.
-	var out syncBuffer
-	r, err := interp.New(interp.Interactive(true), interp.StdIO(strings.NewReader(""), &out, &out))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, err := syntax.NewParser().Parse(strings.NewReader("echo <(sleep 20) >/dev/null"), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // ends the substitution's shell, which follows Run's context
-	_ = r.Run(ctx, f)
-	start := time.Now()
-	r.StopJobs(context.Background())
-	if d := time.Since(start); d > 10*time.Second {
-		t.Fatalf("StopJobs blocked on a process substitution for %v", d)
-	}
-}
-
-func TestResetStopsJobs(t *testing.T) {
-	needsSubprocesses(t)
-	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
-		t.Skip("checking process liveness needs signals")
-	}
-	t.Parallel()
-	// Reset drops the job table, so it must end the jobs first: a detached
-	// job surviving it would be unreachable and unstoppable.
-	var out syncBuffer
-	r, err := interp.New(interp.Interactive(true), interp.StdIO(strings.NewReader(""), &out, &out))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, err := syntax.NewParser().Parse(strings.NewReader("sleep 30 & echo pid=$!"), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	_ = r.Run(ctx, f)
-	cancel()
-	pid := strings.TrimSpace(strings.TrimPrefix(out.String(), "pid="))
-	r.Reset()
-	// Reset waited for the job, so its process is gone and reaped.
-	if s := runSrc(t, "kill -0 "+pid+"; echo st=$?"); !strings.Contains(s, "st=1") {
-		t.Fatalf("job survived Reset: kill -0 = %q", s)
 	}
 }

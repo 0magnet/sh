@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/0magnet/sh/v3/interp"
 	"github.com/u-root/u-root/pkg/core"
 	"github.com/u-root/u-root/pkg/core/base64"
 	"github.com/u-root/u-root/pkg/core/cat"
@@ -30,7 +31,6 @@ import (
 	"github.com/u-root/u-root/pkg/core/tar"
 	"github.com/u-root/u-root/pkg/core/touch"
 	"github.com/u-root/u-root/pkg/core/xargs"
-	"github.com/0magnet/sh/v3/interp"
 )
 
 var commandBuilders = map[string]func() core.Command{

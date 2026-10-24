@@ -243,35 +243,8 @@ var runTests = []runTest{
 	// a builtin we recognize but do not implement is starred, so that help is
 	// an honest statement of what this shell can do
 	{"help -s jobs", "jobs: jobs [-lnprs] [jobspec ...]\n #IGNORE bash's synopsis differs"},
-	{"help -s ulimit", "ulimit: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]\n #IGNORE bash implements ulimit"},
-
-	// job control builtins; the cases needing a job that is still running are
-	// in jobs_test.go, since here the exec middleware backgrounds goroutines
-	// that cancellation cannot interrupt
-	{"jobs", ""},
-	{"kill -l 9", "KILL\n"},
-	{"kill -l TERM", "15\n"},
-	{"kill -l NOPE", "kill: NOPE: invalid signal specification\nexit status 1 #IGNORE bash prefixes its errors with `bash: line N:'"},
-	{"kill", "kill: usage: kill [-s sigspec | -n signum] pid | jobspec ...\nexit status 2 #IGNORE bash prefixes its errors with `bash: line N:'"},
-	{"kill %9", "kill: %9: no such job\nexit status 1 #IGNORE bash prefixes its errors with `bash: line N:'"},
-	{"jobs -Z", "jobs: -Z: invalid option\njobs: usage: jobs [-lnprs] [jobspec ...]\nexit status 2 #IGNORE bash prefixes its errors with `bash: line N:'"},
-
-	// A job nested in another job outlives the one that started it, so the
-	// inner shell still prints after the outer job is done and waited for.
-	{"{ { sleep 0.1; echo child-finished; } & } & wait; sleep 0.3", "child-finished\n"},
-
-	// A finished job is reaped once jobs or wait has reported it, as in bash,
-	// so a second listing shows nothing and the numbering starts again at one.
-	{"sleep 0 & wait; jobs", ""},
-	{"(exit 3) & wait; jobs", ""},
-	{"sleep 0 & wait; sleep 30 & jobs; kill %1", "[1]+  Running                    sleep 30 &\n #IGNORE bash uses real PIDs and its own timing. The sleep here is a Go function which does not watch its context, so kill only asks it to stop and a wait would block until it finishes."},
-	{"true & kill -0 $!; echo st=$?", "st=0\n #IGNORE bash uses real PIDs"},
-	{"sleep 0 & disown; jobs", " #IGNORE bash also lists nothing after disown"},
-	{"(exit 4) & fg; echo st=$?", "(exit 4)\nst=4\n #IGNORE bash prints the job text differently"},
-	{"sleep 0 & wait; bg", "bg: current: no such job\nexit status 1 #IGNORE bash phrases the error differently"},
-	{"sleep 0 & wait %1; echo st=$?", "st=0\n #IGNORE bash uses real PIDs"},
-	{"wait %9", "wait: %9: no such job\nexit status 127 #IGNORE bash prefixes its errors with `bash: line N:'"},
-	{"sleep 30 & sleep 30 & jobs %sleep; kill %1 %2", "jobs: sleep: ambiguous job spec\njobs: %sleep: no such job\n #IGNORE bash prefixes its errors with `bash: line N:'"},
+	{"help -s ulimit", "ulimit: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]\n"},
+	{"help ulimit", "ulimit: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]\n    Modify or display shell resource limits.\n    (recognized by this shell but not implemented)\n\n #IGNORE bash implements ulimit"},
 
 	// times
 	{"times", "0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n #IGNORE we report zeros; bash reports real CPU time"},
@@ -2102,9 +2075,61 @@ read -r l <err; echo "$l"`,
 	{"echo foo | true | false & wait $!", "exit status 1"},
 	{"echo foo | false | true & wait $!", ""},
 	{"f() { false & true; }; f; wait $!", "exit status 1"},
+	// Background jobs keep using the files redirected by their parents.
+	{"{ (sleep 0.01; echo foo) & } >a; wait; cat a", "foo\n"},
+	{"f() { (sleep 0.01; echo foo) & }; f >a; wait; cat a", "foo\n"},
+	{`{ (sleep 0.01; read x; echo "$x") & } <<< foo; wait`, "foo\n"},
 	// $! stays a fake PID here because runTests installs exec middleware;
 	// TestBackgroundRealPID covers the default exec handler.
 	{"sleep 0.01 & case $! in g*) echo fake ;; *) echo real ;; esac; wait", "fake\n #IGNORE bash uses real PIDs"},
+	{"{ { sleep 0.1; echo child-finished; } & } & wait; sleep 0.3", "child-finished\n"},
+	{"{ { { sleep 0.1; echo child-finished; } & } & } & wait; sleep 0.3", "child-finished\n"},
+	{"{ ( { sleep 0.1; echo child-finished; } & ); } & wait; sleep 0.3", "child-finished\n"},
+	{"{ true | { { sleep 0.1; echo child-finished; } & }; } & wait; sleep 0.3", "child-finished\n"},
+	{"{ : <({ sleep 0.1; echo child-finished >&2; } &); } & wait; sleep 0.3", "child-finished\n"},
+	{"{ x=$({ sleep 0.1; echo child-finished >&2; } &); } & wait; sleep 0.3", "child-finished\n"},
+
+	// job control
+	{"jobs", ""},
+	{"jobs -Z", "jobs: invalid option \"-Z\"\nexit status 2 #JUSTERR"},
+	{"sleep 10 & jobs; kill %1", "[1]+  Running                    sleep 10 &\n"},
+	{"sleep 10 & sleep 10 & jobs; kill %1 %2", "[1]-  Running                    sleep 10 &\n[2]+  Running                    sleep 10 &\n"},
+	{"sleep 10 & p=$!; jobs -p >out; kill %%; [[ $(<out) == \"$p\" ]]", ""},
+	{"false & while kill -0 $! 2>/dev/null; do sleep 0.01; done; jobs -p >/dev/null; jobs; jobs", "[1]+  Exit 1                     false\n"},
+	{"sleep 10 & jobs -n; jobs -n; jobs; kill %1", "[1]+  Running                    sleep 10 &\n[1]+  Running                    sleep 10 &\n"},
+	{"sleep 10 & sleep 10 & jobs %1 >/dev/null; jobs -n; jobs -n %1; echo $?; kill %1 %2", "[2]+  Running                    sleep 10 &\n0\n"},
+	{"sleep 10 & jobs -p >/dev/null; jobs -pn; jobs -n; kill %1", "[1]+  Running                    sleep 10 &\n"},
+	{"sleep 10 & p=$!; jobs -np >out; kill %1; [[ $(<out) == \"$p\" ]]", ""},
+	{"false & while kill -0 $! 2>/dev/null; do sleep 0.01; done; jobs -n; jobs -n", "[1]+  Exit 1                     false\n"},
+	{"sleep 10 & jobs >/dev/null; kill %1; wait %1; jobs -n", ""},
+	{"sleep 10 & jobs >/dev/null; kill %1; while kill -0 $! 2>/dev/null; do sleep 0.01; done; jobs -n; jobs -n", "[1]+  Terminated                 sleep 10\n"},
+	{"true & wait; jobs -n; sleep 10 & disown; jobs -n; kill $!", ""},
+	{"sleep 10 & sleep 10 & kill %sleep; echo $?; kill %1 %2", "kill: sleep: ambiguous job spec\n1\n #JUSTERR"},
+	{"sleep 10 & sleep 10 & kill %+ %-; jobs %1; wait %1; echo $?", "[1]-  Running                    sleep 10 &\n143\n"},
+	{"sleep 10 & p=$!; kill $p; wait $p; echo $?", "143\n"},
+	{"sleep 10 & kill -s TERM %1; wait %1; echo $?", "143\n"},
+	{"sleep 10 & kill -n 1 %1; wait $!; echo $?", "129\n #IGNORE bash prints a Hangup message"},
+	{"sleep 10 & kill -0 %1; echo $?; kill %1", "0\n"},
+	{"false & while kill -0 $! 2>/dev/null; do sleep 0.01; done; jobs; jobs", "[1]+  Exit 1                     false\n"},
+	{"true & wait; sleep 10 & jobs; kill %%", "[1]+  Running                    sleep 10 &\n"},
+	{"sleep 0.1 & disown; jobs; wait; echo $?; kill %1", "0\nkill: %1: no such job\nexit status 1 #JUSTERR"},
+	{"kill %9", "kill: %9: no such job\nexit status 1 #JUSTERR"},
+	{"kill 1", "kill: 1: no such job\nexit status 1 #IGNORE only our own jobs can be signalled"},
+	{"wait %9", "wait: %9: no such job\nexit status 127 #JUSTERR"},
+	{"kill", "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]\nexit status 2 #JUSTERR"},
+	{"kill -l 9; kill -l TERM", "KILL\n15\n"},
+	{"kill -l NOPE; kill -STOP %1", "kill: NOPE: invalid signal specification\nkill: STOP: invalid signal specification\nexit status 1 #JUSTERR"},
+	{"fg; bg", "fg: current: no such job\nbg: current: no such job\nexit status 1 #JUSTERR"},
+	{"(exit 4) & fg; echo st=$?", "(exit 4)\nst=4\n #IGNORE bash has no job control when not interactive"},
+	{"sleep 10 & kill %1; fg; echo $?", "sleep 10\n143\n #IGNORE bash has no job control when not interactive"},
+	{"sleep 10 & bg; kill %1", "[1]+ sleep 10 &\n #IGNORE bash has no job control when not interactive"},
+	{"false & while kill -0 $! 2>/dev/null; do sleep 0.01; done; bg", "bg: job 1 has terminated\nexit status 1 #JUSTERR"},
+	{"sleep 10 & jobs -l; kill %1", "[1]+ g1    Running                    sleep 10 &\n #IGNORE bash uses real PIDs"},
+	{"sleep 10 & false & while kill -0 $! 2>/dev/null; do sleep 0.01; done; jobs -r; jobs -s; kill %1", "[1]-  Running                    sleep 10 &\n"},
+	{"sleep 10 & true & kill %?eep; wait %1; echo $?", "143\n"},
+	{"sleep 10 & disown -h; jobs; kill %1", "[1]+  Running                    sleep 10 &\n"},
+	{"sleep 10 & p=$!; true & while kill -0 $! 2>/dev/null; do sleep 0.01; done; disown -r; jobs; kill $p", "[2]+  Done                       true\n #IGNORE bash no longer marks the job as current"},
+	{"sleep 0 & wait %1; echo st=$?", "st=0\n"},
 	// The parent and child shells should not cause data races when setting env vars.
 	// Note that we can't use `echo $var`, as it seems to write newlines separately,
 	// which can cause them to get mixed up between concurrent subshells.
@@ -6058,21 +6083,25 @@ var testBuiltinsMap = map[string]func(interp.HandlerContext, []string) error{
 		}
 		return nil
 	},
-	"sleep": func(hc interp.HandlerContext, args []string) error {
-		for _, arg := range args {
-			// assume and default unit to be in seconds
-			d, err := time.ParseDuration(fmt.Sprintf("%ss", arg))
-			if err != nil {
-				return err
-			}
-			time.Sleep(d)
-		}
-		return nil
-	},
 }
 
 func testExecHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
+		if args[0] == "sleep" { // stops when cancelled, like a killed program
+			for _, arg := range args[1:] {
+				// assume and default unit to be in seconds
+				d, err := time.ParseDuration(arg + "s")
+				if err != nil {
+					return err
+				}
+				select {
+				case <-time.After(d):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
 		if fn := testBuiltinsMap[args[0]]; fn != nil {
 			return fn(interp.HandlerCtx(ctx), args[1:])
 		}

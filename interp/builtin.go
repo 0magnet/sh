@@ -172,15 +172,15 @@ dispatch:
 	case "help":
 		return r.runHelp(args)
 	case "jobs":
-		return r.runJobs(args)
+		return r.jobsBuiltin(args)
 	case "kill":
-		return r.runKill(args)
+		return r.killBuiltin(args)
 	case "disown":
-		return r.runDisown(args)
+		return r.disownBuiltin(args)
 	case "fg":
-		return r.runFg(ctx, args)
+		return r.fgBuiltin(ctx, args)
 	case "bg":
-		return r.runBg(args)
+		return r.bgBuiltin(args)
 	case "enable":
 		return r.runEnable(args)
 	case "compgen":
@@ -416,21 +416,18 @@ dispatch:
 		}
 		if len(args) == 0 {
 			// Note that "wait" without arguments always returns exit status zero.
-			for _, bg := range r.bgProcs {
-				if bg.disowned {
-					continue
+			for i := range r.bgProcs {
+				if bg := &r.bgProcs[i]; !bg.hidden {
+					if !waitDone(ctx, bg.done, &exit) {
+						return exit
+					}
+					bg.hidden = true
 				}
-				if !bg.await(ctx) {
-					return exitStatus{code: 130}
-				}
-			}
-			// Waiting for a job reaps it, as in bash, so that a later jobs
-			// does not list what has already been accounted for.
-			for _, bg := range r.jobList() {
-				r.reapBgProc(bg)
 			}
 			for _, done := range r.pipeProcSubsts {
-				<-done
+				if !waitDone(ctx, done, &exit) {
+					return exit
+				}
 			}
 			r.pipeProcSubsts = nil
 			break
@@ -438,31 +435,18 @@ dispatch:
 		for _, arg := range args {
 			var bg *bgProc
 			if strings.HasPrefix(arg, "%") {
-				// bash's wait takes a job specification as well as a PID.
-				//
-				// It answers 127 here, as it does for a PID that names no
-				// child; the PID path above answers 1 instead, which is a
-				// divergence that predates job control and has a test of its
-				// own, so it is left alone rather than changed in passing.
-				found, err := r.jobSpec(arg)
-				if err != nil {
-					r.errJobSpec("wait", arg, err)
-					return exitStatus{code: 127}
+				var err error
+				if bg, err = r.findJob(arg); err != nil {
+					return failf(127, "wait: %v\n", err)
 				}
-				bg = found
-			} else {
-				found, ok := r.lookupBgProc(arg)
-				if !ok {
-					return failf(1, "wait: pid %s is not a child of this shell\n", arg)
-				}
-				bg = found
+			} else if bg, _ = r.lookupBgProc(arg); bg == nil {
+				return failf(1, "wait: pid %s is not a child of this shell\n", arg)
 			}
-			if !bg.await(ctx) {
-				return exitStatus{code: 130}
+			if !waitDone(ctx, bg.done, &exit) {
+				return exit
 			}
-			exit = bg.finalExit()
-			// Waiting for a job reaps it, as in bash.
-			r.reapBgProc(bg)
+			exit = *bg.exit
+			bg.hidden = true
 		}
 	case "builtin":
 		if len(args) < 1 {

@@ -336,10 +336,8 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 			vr.List = r.Params
 		}
 	case "!":
-		// The most recent background job, whether or not it is still in the
-		// table: bash keeps answering with its PID after it has been reaped.
-		if r.lastBg != nil {
-			vr.Kind, vr.Str = expand.String, r.bgProcID(r.lastBg)
+		if n := len(r.bgProcs); n > 0 {
+			vr.Kind, vr.Str = expand.String, r.bgProcID(&r.bgProcs[n-1])
 		}
 	case "?":
 		vr.Kind, vr.Str = expand.String, strconv.Itoa(int(r.lastExit.code))
