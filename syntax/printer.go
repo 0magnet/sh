@@ -275,7 +275,7 @@ type Printer struct {
 
 	wantNewline bool // newline is wanted for pretty-printing; ignored by singleLine; ignored by singleLine
 	mustNewline bool // newline is required to keep shell syntax valid
-	wroteSemi   bool // wrote ';' for the current statement
+	wroteSemi   bool // the last token written, such as ';' or ';;', ends a statement
 
 	// pendingComments are any comments in the current line or statement
 	// that we have yet to print. This is useful because that way, we can
@@ -420,6 +420,7 @@ func (p *Printer) semiOrNewl(s string, pos Pos) {
 	}
 	p.w.WriteString(s)
 	p.wantSpace = spaceRequired
+	p.wroteSemi = false
 }
 
 func (p *Printer) writeLit(s string) {
@@ -633,21 +634,26 @@ func (p *Printer) newlines(pos Pos) {
 	p.indent()
 }
 
+// rightParenNewline reports whether [Printer.rightParen] starts a new line.
+func (p *Printer) rightParenNewline(pos Pos) bool {
+	return (len(p.pendingHdocs) > 0 || !p.minify) && p.wantsNewline(pos, false)
+}
+
 func (p *Printer) rightParen(pos Pos) {
-	if len(p.pendingHdocs) > 0 || !p.minify {
+	if p.rightParenNewline(pos) {
 		p.newlines(pos)
 	}
 	p.w.WriteByte(')')
 	p.wantSpace = spaceRequired
+	p.wroteSemi = false
 }
 
 // closingParen prints a closing parenthesis at closePos, separating it from a
 // preceding closing parenthesis on the same line to mirror the `( (` spacing
 // that startsWithLparen adds to the matching opening parenthesis.
-func (p *Printer) closingParen(stmts []*Stmt, last []Comment, openPos, closePos Pos) {
+func (p *Printer) closingParen(stmts []*Stmt, closePos Pos) {
 	p.wantSpace = spaceNotRequired
-	if len(last) == 0 && len(stmts) == 1 && endsWithRparen(stmts[0]) &&
-		(p.singleLine || openPos.Line() == closePos.Line()) {
+	if len(stmts) == 1 && endsWithRparen(stmts[0]) && !p.rightParenNewline(closePos) {
 		p.wantSpace = spaceRequired
 	}
 	p.spacePad(closePos)
@@ -667,6 +673,7 @@ func (p *Printer) semiRsrv(s string, pos Pos) {
 	}
 	p.w.WriteString(s)
 	p.wantSpace = spaceRequired
+	p.wroteSemi = false
 }
 
 func (p *Printer) flushComments() {
@@ -838,13 +845,36 @@ func (p *Printer) wroteIndex(index ArithmExpr) bool {
 		return false
 	}
 	p.w.WriteByte('[')
-	// Note that e.g. foo[1,3]=$bar in Zsh does not allow any spaces around the comma,
-	// as that breaks the assignment word.
-	binary, ok := index.(*BinaryArithm)
-	compact := ok && binary.Op == Comma
-	p.arithmExpr(index, compact, false)
+	// Spaces around a comma would split an assignment word like a[1,3]=x,
+	// so keep Bash and mksh commas compact. Zsh subscripts are words,
+	// printed as they were written.
+	switch index := index.(type) {
+	case *Word:
+		p.subscriptWord(index)
+	case *FlagsArithm:
+		p.w.WriteByte('(')
+		p.w.WriteString(index.Flags.Value)
+		p.w.WriteByte(')')
+		if w, ok := index.X.(*Word); ok {
+			p.subscriptWord(w)
+		} else if index.X != nil {
+			p.arithmExpr(index.X, false, false)
+		}
+	default:
+		binary, ok := index.(*BinaryArithm)
+		compact := ok && binary.Op == Comma
+		p.arithmExpr(index, compact, false)
+	}
 	p.w.WriteByte(']')
 	return true
+}
+
+// subscriptWord prints a subscript word like a double-quoted string,
+// keeping any escaped newlines between its parts, as the zsh lexer
+// treats the subscript like one.
+func (p *Printer) subscriptWord(w *Word) {
+	p.wordParts(w.Parts, true)
+	p.wantSpace = spaceRequired
 }
 
 func (p *Printer) paramExp(pe *ParamExp) {
@@ -978,7 +1008,7 @@ func (p *Printer) cmdSubst(cs *CmdSubst) {
 			p.wantNewline = true
 		}
 		p.nestedStmts(cs.Stmts, cs.Last, cs.Right)
-		p.closingParen(cs.Stmts, cs.Last, cs.Left, cs.Right)
+		p.closingParen(cs.Stmts, cs.Right)
 	}
 }
 
@@ -1093,6 +1123,9 @@ func (p *Printer) arithmExprRecurse(expr ArithmExpr, compact, spacePlusMinus boo
 		}
 		p.w.WriteByte(')')
 	}
+	if expr != nil {
+		p.advanceLine(expr.End().Line())
+	}
 }
 
 func (p *Printer) testExpr(expr TestExpr) {
@@ -1144,6 +1177,7 @@ func (p *Printer) testExprSameLine(expr TestExpr) {
 		p.testExpr(expr.X)
 		p.w.WriteByte(')')
 	}
+	p.advanceLine(expr.End().Line())
 }
 
 func (p *Printer) word(w *Word) {
@@ -1151,25 +1185,11 @@ func (p *Printer) word(w *Word) {
 	p.wantSpace = spaceRequired
 }
 
+// unquotedWord prints a heredoc's closing word,
+// which must match how the parser finds the end of its body.
 func (p *Printer) unquotedWord(w *Word) {
-	for _, wp := range w.Parts {
-		switch wp := wp.(type) {
-		case *SglQuoted:
-			p.writeLit(wp.Value)
-		case *DblQuoted:
-			p.wordParts(wp.Parts, true)
-		case *Lit:
-			for i := 0; i < len(wp.Value); i++ {
-				if b := wp.Value[i]; b == '\\' {
-					if i++; i < len(wp.Value) {
-						p.w.WriteByte(wp.Value[i])
-					}
-				} else {
-					p.w.WriteByte(b)
-				}
-			}
-		}
-	}
+	stop, _ := unquotedWordBytes(w)
+	p.writeLit(string(stop))
 }
 
 func (p *Printer) wordJoin(ws []*Word) {
@@ -1190,12 +1210,14 @@ func (p *Printer) wordJoin(ws []*Word) {
 	}
 }
 
-func (p *Printer) casePatternJoin(pats []*Word) {
+// casePatternJoin reports whether it printed a leading "(".
+func (p *Printer) casePatternJoin(pats []*Word) (lparen bool) {
 	anyNewline := false
 	for i, w := range pats {
 		// Only valid situation for a literal 'esac' here is with a preceding left paran.
 		if i == 0 && w.Lit() == "esac" {
 			p.w.WriteString("(")
+			lparen = true
 		}
 		if i > 0 {
 			p.spacedToken("|", Pos{})
@@ -1214,6 +1236,7 @@ func (p *Printer) casePatternJoin(pats []*Word) {
 	if anyNewline {
 		p.decLevel()
 	}
+	return lparen
 }
 
 func (p *Printer) elemJoin(elems []*ArrayElem, last []Comment) {
@@ -1257,6 +1280,7 @@ func (p *Printer) stmt(s *Stmt) {
 	var startRedirs int
 	if s.Cmd != nil {
 		startRedirs = p.command(s.Cmd, s.Redirs)
+		p.advanceLine(s.Cmd.End().Line())
 	}
 	p.incLevel()
 	for _, r := range s.Redirs[startRedirs:] {
@@ -1353,6 +1377,10 @@ func (p *Printer) command(cmd Command, redirs []*Redirect) (startRedirs int) {
 		p.wantNewline = p.wantNewline || p.funcNextLine
 		p.nestedStmts(cmd.Stmts, cmd.Last, cmd.Rbrace)
 		p.semiRsrv("}", cmd.Rbrace)
+	case *TryClause:
+		p.command(cmd.Try, nil)
+		p.spacedString("always", cmd.AlwaysPos)
+		p.command(cmd.Always, nil)
 	case *IfClause:
 		p.ifClause(cmd, false)
 	case *Subshell:
@@ -1369,17 +1397,18 @@ func (p *Printer) command(cmd Command, redirs []*Redirect) (startRedirs int) {
 					p.mustNewline = true
 				}
 			}
-		} else if len(stmts) == 0 {
-			// Zsh allows empty subshells, but prevent `()`
-			// from looking like `() { anon-func; }`.
-			p.wantSpace = spaceRequired
 		} else {
 			p.wantSpace = spaceNotRequired
 		}
 
 		p.spacePad(stmtsPos(cmd.Stmts, cmd.Last))
 		p.nestedStmts(cmd.Stmts, cmd.Last, cmd.Rparen)
-		p.closingParen(cmd.Stmts, cmd.Last, cmd.Lparen, cmd.Rparen)
+		if len(stmts) == 0 && !p.rightParenNewline(cmd.Rparen) {
+			// Zsh allows empty subshells, but prevent `()`
+			// from looking like `() { anon-func; }`.
+			p.space()
+		}
+		p.closingParen(cmd.Stmts, cmd.Rparen)
 	case *WhileClause:
 		if cmd.Until {
 			p.spacedString("until", cmd.Pos())
@@ -1506,9 +1535,10 @@ func (p *Printer) command(cmd Command, redirs []*Redirect) (startRedirs int) {
 			}
 			p.newlines(ci.Pos())
 			p.spacePad(ci.Pos())
-			p.casePatternJoin(ci.Patterns)
+			lparen := p.casePatternJoin(ci.Patterns)
 			p.w.WriteByte(')')
-			if !p.minify {
+			// zsh reads "(esac)foo" as a single pattern.
+			if !p.minify || lparen {
 				p.wantSpace = spaceRequired
 			} else {
 				p.wantSpace = spaceNotRequired
@@ -1524,6 +1554,12 @@ func (p *Printer) command(cmd Command, redirs []*Redirect) (startRedirs int) {
 				p.spacedToken(ci.Op.String(), ci.OpPos)
 				p.advanceLine(ci.OpPos.Line())
 				// avoid ; directly after tokens like ;;
+				p.wroteSemi = true
+			} else if len(ci.Stmts) == 0 {
+				// "case x in y);esac" is invalid; print "y)esac".
+				if lparen && !p.wantsNewline(cmd.Esac, false) {
+					p.space()
+				}
 				p.wroteSemi = true
 			}
 			p.comments(last...)
@@ -1646,7 +1682,7 @@ func (p *Printer) stmtList(stmts []*Stmt, last []Comment) {
 		for _, c := range s.Comments {
 			// Comments after the end of this command. Note that
 			// this includes "<<EOF # comment".
-			if s.Cmd != nil && c.End().After(s.Cmd.End()) {
+			if c.Pos().After(pos) && (s.Cmd == nil || c.End().After(s.Cmd.End())) {
 				endComs = append(endComs, c)
 				break
 			}
@@ -1675,6 +1711,11 @@ func (p *Printer) stmtList(stmts []*Stmt, last []Comment) {
 		p.advanceLine(pos.Line())
 		p.comments(midComs...)
 		p.stmt(s)
+		for _, c := range endComs {
+			// A trailing comment may follow escaped newlines.
+			p.bslashNewlIfWanted(c.Pos())
+			p.advanceLine(c.Pos().Line())
+		}
 		p.comments(endComs...)
 		p.wantNewline = true
 	}
@@ -1726,6 +1767,13 @@ func (p *Printer) stmtsForceNewline(stmts []*Stmt, last []Comment, closing Pos) 
 		// Force a newline if we find:
 		//     for i in a b # stmt
 		//     do foo; done
+		return true
+	case !p.minify && len(stmts) > 0 && len(stmts[0].Comments) > 0 &&
+		stmts[0].Comments[0].Pos().Line() < p.line:
+		// Force a newline if a comment precedes the opening token
+		// which moved up to the current line, as in:
+		//     { foo; } always # stmt
+		//     { bar; }
 		return true
 	}
 	return false

@@ -130,17 +130,21 @@ func TestParseConfirm(t *testing.T) {
 	}
 }
 
-func TestParseBashKeepComments(t *testing.T) {
+func TestParseKeepComments(t *testing.T) {
 	t.Parallel()
-	p := NewParser(KeepComments(true))
-	for i, c := range fileTestsKeepComments {
-		want, _ := c.byLangIndex[LangBash.index()].(*File)
-		if want == nil {
-			continue
-		}
-		for j, in := range c.inputs {
-			t.Run(fmt.Sprintf("%03d-%d", i, j), singleParse(p, in, want))
-		}
+	for lang := range langResolvedVariants.bits() {
+		t.Run(lang.String(), func(t *testing.T) {
+			p := NewParser(Variant(lang), KeepComments(true))
+			for i, c := range fileTestsKeepComments {
+				want, _ := c.byLangIndex[lang.index()].(*File)
+				if want == nil {
+					continue
+				}
+				for j, in := range c.inputs {
+					t.Run(fmt.Sprintf("%03d-%d", i, j), singleParse(p, in, want))
+				}
+			}
+		})
 	}
 }
 
@@ -591,6 +595,29 @@ var errorCases = []errorCase{
 		langErr("1:5: `}` can only be used to close a block", LangZsh),
 	),
 	errCase(
+		"{ foo; } always",
+		langErr("1:10: `always` must be followed by `{`", LangZsh),
+		langErr("1:10: `always` blocks are a zsh feature; tried parsing as LANG", LangPOSIX|LangBash|LangMirBSDKorn),
+	),
+	errCase(
+		"{ foo; } always foo",
+		langErr("1:10: `always` must be followed by `{`", LangZsh),
+		langErr("1:10: `always` blocks are a zsh feature; tried parsing as LANG", LangPOSIX|LangBash|LangMirBSDKorn),
+	),
+	errCase(
+		"{ foo; } >a always { bar; }",
+		langErr("1:13: statements must be separated by &, ; or a newline"),
+	),
+	errCase(
+		"{ foo; }\nalways { bar; }",
+		langErr("2:15: `}` can only be used to close a block"),
+	),
+	errCase(
+		"f() { foo; } always { bar; }",
+		langErr("1:14: `always` cannot follow a function body", LangZsh),
+		langErr("1:14: `always` blocks are a zsh feature; tried parsing as LANG", LangPOSIX|LangBash|LangMirBSDKorn),
+	),
+	errCase(
 		"then",
 		langErr("1:1: `then` can only be used in an `if`"),
 	),
@@ -865,6 +892,14 @@ var errorCases = []errorCase{
 	errCase(
 		"<<",
 		langErr("1:1: `<<` must be followed by a word"),
+	),
+	errCase(
+		"`<<`",
+		langErr("1:2: `<<` must be followed by a word"),
+	),
+	errCase(
+		"echo `cat <<",
+		langErr("1:11: `<<` must be followed by a word"),
 	),
 	errCase(
 		"<<EOF",
@@ -1502,7 +1537,7 @@ var errorCases = []errorCase{
 	errCase(
 		"]] )",
 		langErr("1:1: `]]` can only be used to close a test"),
-		langErr("1:4: a command can only contain words and redirects; encountered `)`", LangPOSIX),
+		langErr("1:1: `[[ ]]` tests are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
 	),
 	errCase(
 		"((foo",
@@ -1691,6 +1726,7 @@ var errorCases = []errorCase{
 	errCase(
 		"[[ (a) == b ]]",
 		langErr("1:8: expected `&&`, `||` or `]]` after complex expr", LangBash|LangMirBSDKorn|LangZsh),
+		langErr("1:1: `[[ ]]` tests are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
 	),
 	errCase(
 		"[[ a =~ ; ]]",
@@ -1736,11 +1772,13 @@ var errorCases = []errorCase{
 	),
 	errCase(
 		"a=([)",
-		langErr("1:4: `[` must be followed by an expression", LangBash|LangZsh),
+		langErr("1:4: `[` must be followed by an expression", LangBash),
+		langErr("1:4: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"a=([i)",
-		langErr("1:4: reached `)` without matching `[` with `]`", LangBash|LangZsh),
+		langErr("1:4: reached `)` without matching `[` with `]`", LangBash),
+		langErr("1:4: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"a=([i])",
@@ -1808,6 +1846,10 @@ var errorCases = []errorCase{
 		langErr("1:1: `foo()` must be followed by a statement", LangBash|LangMirBSDKorn|LangZsh),
 	),
 	errCase(
+		">f function foo { a; }",
+		langErr("1:22: `}` can only be used to close a block", LangPOSIX),
+	),
+	errCase(
 		"@test",
 		langErr("1:1: `@test` must be followed by a description word", LangBats),
 	),
@@ -1821,7 +1863,8 @@ var errorCases = []errorCase{
 	),
 	errCase(
 		"a[",
-		langErr("1:2: `[` must be followed by an expression", LangBash|LangMirBSDKorn|LangZsh),
+		langErr("1:2: `[` must be followed by an expression", LangBash|LangMirBSDKorn),
+		langErr("1:2: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"a[b",
@@ -1834,15 +1877,18 @@ var errorCases = []errorCase{
 	),
 	errCase(
 		"a[[",
-		langErr("1:3: `[` must follow a name like a[i]", LangBash|LangMirBSDKorn|LangZsh),
+		langErr("1:3: `[` must follow a name like a[i]", LangBash|LangMirBSDKorn),
+		langErr("1:2: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"echo $((a[))",
-		langErr("1:10: `[` must be followed by an expression", LangBash|LangMirBSDKorn|LangZsh),
+		langErr("1:10: `[` must be followed by an expression", LangBash|LangMirBSDKorn),
+		langErr("1:10: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"echo $((a[b))",
-		langErr("1:10: reached `)` without matching `[` with `]`", LangBash|LangMirBSDKorn|LangZsh),
+		langErr("1:10: reached `)` without matching `[` with `]`", LangBash|LangMirBSDKorn),
+		langErr("1:10: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"echo $((a[]))",
@@ -1852,7 +1898,7 @@ var errorCases = []errorCase{
 	errCase(
 		"echo $((x$t[",
 		langErr("1:12: `[` must follow a name like a[i]", LangBash|LangMirBSDKorn),
-		langErr("1:12: `[` must be followed by an expression", LangZsh),
+		langErr("1:12: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"a[1]",
@@ -1920,11 +1966,16 @@ var errorCases = []errorCase{
 	),
 	errCase(
 		"echo ${foo[1 2]}",
-		langErr("1:14: not a valid arithmetic operator: `2`", LangBash|LangMirBSDKorn|LangZsh),
+		langErr("1:14: not a valid arithmetic operator: `2`", LangBash|LangMirBSDKorn),
 	),
 	errCase(
 		"echo ${foo[}",
-		langErr("1:11: `[` must be followed by an expression", LangBash|LangMirBSDKorn|LangZsh),
+		langErr("1:11: `[` must be followed by an expression", LangBash|LangMirBSDKorn),
+		langErr("1:11: reached EOF without matching `[` with `]`", LangZsh),
+	),
+	errCase(
+		"echo ${foo[a[b]}",
+		langErr("1:11: reached EOF without matching `[` with `]`", LangZsh),
 	),
 	errCase(
 		"echo ${foo]}",

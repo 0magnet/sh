@@ -6,15 +6,18 @@ package interp
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 
@@ -155,6 +158,11 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 		exit.code = code
 		return exit
 	}
+	// fatal reports an error like that of an expansion, such as a limit.
+	fatal := func(err error) exitStatus {
+		r.expandErr(fmt.Errorf("%s: %w", name, err))
+		return exit
+	}
 	// checkVar fails the builtin after a variable error, which is
 	// already reported; see [Runner.varErr].
 	checkVar := func(err error) {
@@ -200,33 +208,37 @@ dispatch:
 		// the values being non-zero.
 		r.out("0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n")
 	case "umask":
-		symbolic := false
-		rest := args
-		for len(rest) > 0 && strings.HasPrefix(rest[0], "-") && rest[0] != "-" {
-			switch rest[0] {
+		asCommand, symbolic := false, false
+		fp := flagParser{remaining: args}
+		for fp.more() {
+			switch flag := fp.flag(); flag {
+			case "-p":
+				asCommand = true
 			case "-S":
 				symbolic = true
-			case "-p":
-				// "print in a form reusable as input" — the mask line below
-				// already is, so -p only differs by the leading word.
 			default:
-				return failf(2, "umask: %s: invalid option\n", rest[0])
+				return failf(2, "umask: invalid option %q\n", flag)
 			}
-			rest = rest[1:]
 		}
-		if len(rest) > 0 {
-			mask, err := strconv.ParseUint(rest[0], 8, 32)
-			if err != nil {
-				return failf(2, "umask: %s: octal number expected\n", rest[0])
+		if rest := fp.args(); len(rest) > 0 {
+			mask, ok := parseUmask(r.umask, rest[0])
+			if !ok {
+				return failf(1, "umask: %s: invalid mode\n", rest[0])
 			}
-			r.umask = uint32(mask)
+			r.umask = mask
+			if symbolic {
+				r.out(umaskString(mask) + "\n")
+			}
 			break
 		}
+		mode, prefix := fmt.Sprintf("%04o", r.umask), "umask "
 		if symbolic {
-			r.out(umaskSymbolic(r.umask) + "\n")
-		} else {
-			r.outf("%04o\n", r.umask)
+			mode, prefix = umaskString(r.umask), "umask -S "
 		}
+		if !asCommand {
+			prefix = ""
+		}
+		r.out(prefix + mode + "\n")
 	case "exit":
 		switch len(args) {
 		case 0:
@@ -315,12 +327,22 @@ dispatch:
 			}
 			args = args[1:]
 		}
+		if doExpand {
+			// One format for all arguments, so that \c stops all output.
+			format := strings.TrimSuffix(strings.Repeat("%b ", len(args)), " ")
+			if newline {
+				format += "\n"
+			}
+			s, _, err := expand.Format(r.ecfg, format, args)
+			if err != nil {
+				return fatal(err) // the output is too large
+			}
+			r.out(s)
+			break
+		}
 		for i, arg := range args {
 			if i > 0 {
 				r.out(" ")
-			}
-			if doExpand {
-				arg, _, _ = expand.Format(r.ecfg, arg, nil)
 			}
 			r.out(arg)
 		}
@@ -334,7 +356,9 @@ dispatch:
 		format, args := args[0], args[1:]
 		for {
 			s, n, err := expand.Format(r.ecfg, format, args)
-			if err != nil {
+			if _, ok := errors.AsType[internal.FatalError](err); ok {
+				return fatal(err)
+			} else if err != nil {
 				return failf(1, "%v\n", err)
 			}
 			r.out(s)
@@ -618,6 +642,12 @@ dispatch:
 		args = args[:len(args)-1]
 		fallthrough
 	case "test":
+		// Like Bash, two arguments must be "!" or a unary operator and a word.
+		if len(args) == 2 {
+			if op := testUnaryOp(args[0]); op == illegalTok || op == syntax.TsParen {
+				return failf(2, "%v: %s: unary operator expected\n", pos, args[0])
+			}
+		}
 		parseErr := false
 		p := testParser{
 			rem: args,
@@ -778,6 +808,8 @@ dispatch:
 		raw := false
 		silent := false
 		readArray := false
+		delim := int('\n')
+		nchars := -1
 		fp := flagParser{remaining: args}
 		for fp.more() {
 			switch flag := fp.flag(); flag {
@@ -787,10 +819,30 @@ dispatch:
 				raw = true
 			case "-a":
 				readArray = true
-			case "-p":
-				prompt = fp.value()
-				if prompt == "" {
-					return failf(2, "read: -p: option requires an argument\n")
+			case "-p", "-d", "-n", "-N":
+				value, ok := fp.optValue()
+				if !ok {
+					return failf(2, "read: %s: option requires an argument\n", flag)
+				}
+				switch flag {
+				case "-p":
+					prompt = value
+				case "-d":
+					// Like Bash, only the first byte is used,
+					// and an empty delimiter means NUL.
+					delim = 0
+					if value != "" {
+						delim = int(value[0])
+					}
+				case "-n", "-N":
+					n, err := strconv.Atoi(value)
+					if err != nil || n < 0 {
+						return failf(1, "read: invalid number %q\n", value)
+					}
+					nchars = n
+					if flag == "-N" {
+						delim = -1
+					}
 				}
 			default:
 				return failf(2, "read: invalid option %q\n", flag)
@@ -817,27 +869,18 @@ dispatch:
 		if terminal {
 			// Only a terminal echoes what we read, so it is the only case
 			// where we need to read without echoing.
+			// TODO: support -d, -n, and -N here too.
 			line, err = term.ReadPassword(fd)
 		} else {
-			line, err = r.readLine(ctx, raw)
+			line, err = r.readLine(ctx, raw, delim, nchars)
 		}
-		if readArray {
-			// read -a arrayname: split line into fields and assign to indexed array.
-			arrayName := shellReplyVar
-			if len(args) > 0 {
-				arrayName = args[0]
-			}
-			// Use -1 as max to get all fields without joining the last ones.
-			values := expand.ReadFields(r.ecfg, string(line), -1, raw)
-			arrayName, _ = r.resolveName(arrayName)
-			checkVar(r.setVar(arrayName, expand.Variable{
-				Set:  true,
-				Kind: expand.Indexed,
-				List: values,
-			}))
-		} else if len(args) == 0 {
-			// Bare "read" assigns the whole line to REPLY without any
-			// trimming, only discarding backslash escapes unless raw.
+		if err == errReadTooLarge {
+			return fatal(err)
+		}
+		var values []string
+		if delim < 0 || (len(args) == 0 && !readArray) {
+			// Bare "read" and "read -N" assign the whole input without any
+			// field splitting, only discarding backslash escapes unless raw.
 			val := string(line)
 			if !raw {
 				var sb strings.Builder
@@ -852,9 +895,29 @@ dispatch:
 				}
 				val = sb.String()
 			}
-			checkVar(r.setVarString(shellReplyVar, val))
+			values = []string{val}
 		} else {
-			values := expand.ReadFields(r.ecfg, string(line), len(args), raw)
+			max := len(args)
+			if readArray {
+				max = -1 // all fields, without joining the last ones
+			}
+			values = expand.ReadFields(r.ecfg, string(line), max, raw)
+		}
+		switch {
+		case readArray:
+			arrayName := shellReplyVar
+			if len(args) > 0 {
+				arrayName = args[0]
+			}
+			arrayName, _ = r.resolveName(arrayName)
+			checkVar(r.setVar(arrayName, expand.Variable{
+				Set:  true,
+				Kind: expand.Indexed,
+				List: values,
+			}))
+		case len(args) == 0:
+			checkVar(r.setVarString(shellReplyVar, values[0]))
+		default:
 			for i, name := range args {
 				val := ""
 				if i < len(values) {
@@ -1133,7 +1196,13 @@ dispatch:
 		vr := expand.Variable{Set: true, Kind: expand.Indexed}
 		scanner := bufio.NewScanner(r.stdin)
 		scanner.Split(mapfileSplit(delim[0], dropDelim))
+		size := 0
 		for scanner.Scan() {
+			if size += len(scanner.Bytes()); size > internal.MaxExpandSize {
+				return fatal(errReadTooLarge)
+			} else if len(vr.List) > internal.MaxExpandFields {
+				break // [Runner.setVarIn] fails
+			}
 			vr.List = append(vr.List, scanner.Text())
 		}
 		if err := scanner.Err(); err != nil {
@@ -1181,13 +1250,24 @@ func (r *Runner) printOptLine(name string, enabled, supported bool) {
 	r.outf("%s\t%s\t(%q not supported)\n", name, state, r.optStatusText(!enabled))
 }
 
-func (r *Runner) readLine(ctx context.Context, raw bool) ([]byte, error) {
+// errReadTooLarge is like the size limit of an expansion,
+// for builtins which read input into variables.
+var errReadTooLarge = internal.Fatalf("input would exceed %d bytes", internal.MaxExpandSize)
+
+// readLine reads from stdin until delim, or EOF if delim is -1,
+// or until nchars characters if nchars is not negative.
+// Unless raw, it drops line continuations and keeps other escapes.
+func (r *Runner) readLine(ctx context.Context, raw bool, delim, nchars int) ([]byte, error) {
 	if r.stdin == nil {
 		return nil, errors.New("interp: can't read, there's no stdin")
+	}
+	if nchars == 0 {
+		return nil, nil
 	}
 
 	var line []byte
 	esc := false
+	charStart := 0 // where the character being read starts in line
 
 	stopc := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
@@ -1203,23 +1283,37 @@ func (r *Runner) readLine(ctx context.Context, raw bool) ([]byte, error) {
 		}
 	}()
 	for {
+		// Read one byte at a time, so that we don't consume
+		// any input past what we return.
 		var buf [1]byte
 		n, err := r.stdin.Read(buf[:])
 		if n > 0 {
 			b := buf[0]
 			switch {
-			case !raw && b == '\\':
+			case !raw && b == '\\' && !esc:
 				line = append(line, b)
-				esc = !esc
+				charStart = len(line)
+				esc = true
 			case !raw && b == '\n' && esc:
 				// line continuation; drop the trailing backslash
 				line = line[:len(line)-1]
+				charStart = len(line)
 				esc = false
-			case b == '\n':
+			case !esc && int(b) == delim:
 				return line, nil
 			default:
 				line = append(line, b)
 				esc = false
+				// Count characters rather than bytes, like Bash in a UTF-8 locale.
+				if utf8.FullRune(line[charStart:]) {
+					charStart = len(line)
+					if nchars--; nchars == 0 {
+						return line, nil
+					}
+				}
+			}
+			if len(line) > internal.MaxExpandSize {
+				return nil, errReadTooLarge
 			}
 		}
 		if err != nil {
@@ -1271,10 +1365,12 @@ func (r *Runner) absPath(path string) string {
 // It's similar to the getopts implementation, but with some key differences.
 // First, the API is designed for Go loops, making it easier to use directly.
 // Second, it doesn't require the awkward ":ab" syntax that getopts uses.
-// Third, it supports "-a" flags as well as "+a".
+// Third, it supports "+a" flags as well as "-a" when plus is set, which only
+// set and declare need; every other bash builtin takes "+a" as an operand.
 type flagParser struct {
 	current   string
 	remaining []string
+	plus      bool
 }
 
 func (p *flagParser) more() bool {
@@ -1293,7 +1389,7 @@ func (p *flagParser) more() bool {
 		p.remaining = p.remaining[1:]
 		return false
 	}
-	if len(arg) == 0 || (arg[0] != '-' && arg[0] != '+') {
+	if len(arg) == 0 || arg[0] != '-' && (arg[0] != '+' || !p.plus) {
 		// The next argument is not a flag.
 		return false
 	}
@@ -1324,6 +1420,19 @@ func (p *flagParser) value() string {
 	arg := p.remaining[0]
 	p.remaining = p.remaining[1:]
 	return arg
+}
+
+// optValue returns the argument to the last flag, attached or not.
+func (p *flagParser) optValue() (string, bool) {
+	if p.current != "" {
+		value := p.current[1:]
+		p.current = ""
+		return value, true
+	}
+	if len(p.remaining) == 0 {
+		return "", false
+	}
+	return p.value(), true
 }
 
 func (p *flagParser) args() []string { return p.remaining }
@@ -1391,23 +1500,50 @@ func (r *Runner) optStatusText(status bool) string {
 	return "off"
 }
 
-// umaskSymbolic renders a mask the way `umask -S` does: the permissions that
-// remain, not the ones masked off.
-func umaskSymbolic(mask uint32) string {
-	var b strings.Builder
-	for i, who := range []string{"u", "g", "o"} {
-		if i > 0 {
-			b.WriteByte(',')
+// umaskClause matches one symbolic mode clause, like `u=rwx` or `g+w`.
+var umaskClause = regexp.MustCompile(`^([ugoa]*)([-+=])([rwx]*)$`)
+
+// parseUmask parses a umask operand, either octal or symbolic like
+// `u=rwx,g+w,o-rx`. Symbolic clauses modify the permissions which the
+// current mask leaves on, and an omitted who means `a`. Unlike bash, a
+// clause may not chain operators, as in `u+r-w`.
+func parseUmask(cur os.FileMode, s string) (os.FileMode, bool) {
+	if n, err := strconv.ParseUint(s, 8, 32); err == nil && n <= 0o7777 {
+		return os.FileMode(n) & 0o777, true
+	}
+	bits := ^cur & 0o777
+	for clause := range strings.SplitSeq(s, ",") {
+		m := umaskClause.FindStringSubmatch(clause)
+		if m == nil {
+			return 0, false
 		}
-		b.WriteString(who)
-		b.WriteByte('=')
-		shift := uint(6 - 3*i)
-		bits := (mask >> shift) & 7
-		for j, perm := range []string{"r", "w", "x"} {
-			if bits&(4>>uint(j)) == 0 {
-				b.WriteString(perm)
-			}
+		who := modeBits(cmp.Or(m[1], "a"), "ugoa", 0o700, 0o070, 0o007, 0o777)
+		perm := modeBits(m[3], "rwx", 0o444, 0o222, 0o111)
+		switch m[2] {
+		case "+":
+			bits |= perm & who
+		case "-":
+			bits &^= perm & who
+		case "=":
+			bits = bits&^who | perm&who
 		}
 	}
-	return b.String()
+	return ^bits & 0o777, true
+}
+
+// modeBits ors the bits for each byte of s by its index in letters.
+func modeBits(s, letters string, bits ...os.FileMode) (got os.FileMode) {
+	for i := range len(s) {
+		got |= bits[strings.IndexByte(letters, s[i])]
+	}
+	return got
+}
+
+var permNames = [8]string{"", "x", "w", "wx", "r", "rx", "rw", "rwx"}
+
+// umaskString renders a mask as `umask -S` does: the permissions it leaves
+// on, not the ones it masks off.
+func umaskString(mask os.FileMode) string {
+	p := ^mask & 0o777
+	return fmt.Sprintf("u=%s,g=%s,o=%s", permNames[p>>6&7], permNames[p>>3&7], permNames[p&7])
 }

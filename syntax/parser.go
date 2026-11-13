@@ -51,6 +51,10 @@ const (
 	// LangPOSIX corresponds to the POSIX Shell language, as described at
 	// https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html.
 	//
+	// The words `[[`, `]]`, `select`, and `function`, which POSIX says may be
+	// reserved with unspecified results, are rejected at the start of a command,
+	// as they are reserved in the other dialects.
+	//
 	// Its string representation is "posix" or "sh".
 	LangPOSIX
 
@@ -514,6 +518,10 @@ type Parser struct {
 	quote   quoteState // current lexer state
 	eqlOffs int        // position of '=' in [Parser.val] when [Parser.tok].isLit is true
 
+	// zshSubDepth counts the unclosed '[' within the current zsh subscript,
+	// as brackets nest and only a matching ']' ends it.
+	zshSubDepth int
+
 	keepComments bool
 	lang         LangVariant
 
@@ -552,6 +560,11 @@ type Parser struct {
 
 	accComs []Comment
 	curComs *[]Comment
+
+	// lineCom is the position of the comment which ended the logical line
+	// of the token before the current one, if any. Such a comment may be
+	// on a later line when it follows escaped newlines.
+	lineCom Pos
 
 	litBatch  []Lit
 	wordBatch []wordAlloc
@@ -710,7 +723,11 @@ const (
 	switchCase
 	// paramExpArithm is a subscript like ${a[i]}, which can be a string key
 	// rather than an arithmetic expression when the array is associative.
+	// Only used by Bash and mksh; see zshSubscript.
 	paramExpArithm
+	// zshSubscript is a subscript with [LangZsh], lexed like a double-quoted
+	// string where brackets nest unless escaped; see [Assign.Index].
+	zshSubscript
 	// paramExpSlice is a slice like ${a:i:j}, which is always arithmetic.
 	paramExpSlice
 	paramExpRepl
@@ -718,7 +735,7 @@ const (
 	arrayElems
 
 	allKeepSpaces = runeByRune | paramExpRepl | dblQuotes | hdocBody |
-		hdocBodyTabs | paramExpRepl | paramExpExp
+		hdocBodyTabs | paramExpRepl | paramExpExp | zshSubscript
 	allRegTokens = noState | unquotedWordCont | subCmd | subCmdBckquo | subCmdBraces |
 		hdocWord | switchCase | arrayElems | testExpr
 	allArithmExpr = arithmExpr | arithmExprLet | arithmExprCmd |
@@ -741,22 +758,23 @@ func (p *Parser) postNested(s saveState) {
 	p.quote, p.buriedHdocs = s.quote, s.buriedHdocs
 }
 
-func unquotedWordBytes(w *Word) ([]byte, bool) {
-	buf := make([]byte, 0, 4)
-	didUnquote := false
+func unquotedWordBytes(w *Word) (buf []byte, quoted bool) {
+	buf = make([]byte, 0, 4)
 	for _, wp := range w.Parts {
-		// TODO: a partly quoted word such as 'A'B is quoted,
-		// but this only reports whether its last part is.
-		buf, didUnquote = unquotedWordPart(buf, wp, false)
+		var partQuoted bool
+		buf, partQuoted = unquotedWordPart(buf, wp, false)
+		quoted = quoted || partQuoted
 	}
-	return buf, didUnquote
+	return buf, quoted
 }
 
 func unquotedWordPart(buf []byte, wp WordPart, quotes bool) (_ []byte, quoted bool) {
 	switch wp := wp.(type) {
 	case *Lit:
 		for i := 0; i < len(wp.Value); i++ {
-			if b := wp.Value[i]; b == '\\' && !quotes {
+			// Within double quotes, only some backslashes are escapes.
+			if b := wp.Value[i]; b == '\\' && (!quotes ||
+				i+1 < len(wp.Value) && dquoteEscaped(wp.Value[i+1])) {
 				if i++; i < len(wp.Value) {
 					buf = append(buf, wp.Value[i])
 				}
@@ -908,10 +926,7 @@ func (p *Parser) followStmts(left string, lpos Pos, stops ...string) ([]*Stmt, [
 		return nil, nil
 	}
 	stmts, last := p.stmtList(stops...)
-	if len(stmts) < 1 {
-		if p.lang.in(LangZsh | LangMirBSDKorn) {
-			return nil, nil // allow an empty list
-		}
+	if len(stmts) < 1 && !p.lang.in(LangZsh|LangMirBSDKorn) {
 		if p.recoverError() {
 			return []*Stmt{{Position: recoveredPos}}, nil
 		}
@@ -1512,21 +1527,7 @@ func (p *Parser) paramExp() *ParamExp {
 	}
 	if !pe.Short && p.r == '(' {
 		p.checkLang(pe.Pos(), LangZsh, `parameter expansion flags`)
-		// For now, for simplicity, we parse flags as just a literal.
-		// In the future, parsing as a word is better for cases like
-		// `${(ps.$sep.)val}`.
-		lparen := p.nextPos()
-		p.rune()
-		p.pos = p.nextPos()
-		for p.newLit(p.r); p.r != runeEOF && p.r != ')'; p.rune() {
-		}
-		p.val = p.endLit()
-		if p.r != ')' {
-			p.tok = _EOF // we can only get here due to EOF
-			p.matchingErr(lparen, leftParen, rightParen)
-		}
-		pe.Flags = p.lit(p.pos, p.val)
-		p.rune()
+		pe.Flags = p.zshFlags()
 	}
 	// Zsh-only prefixes that change how the parameter is expanded.
 	// They may appear in any combination, like ${=^name}.
@@ -1885,8 +1886,11 @@ func (p *Parser) paramExpExp() *Expansion {
 }
 
 func (p *Parser) eitherIndex() ArithmExpr {
-	old := p.quote
 	lpos := p.pos
+	if p.lang.in(LangZsh) {
+		return p.zshSubscript(lpos)
+	}
+	old := p.quote
 	p.quote = paramExpArithm
 	p.next()
 	if p.tok == star || p.tok == at {
@@ -1898,33 +1902,95 @@ func (p *Parser) eitherIndex() ArithmExpr {
 	return expr
 }
 
-func (p *Parser) zshSubFlags() *FlagsArithm {
-	zf := &FlagsArithm{}
-	// Lex flags as raw text, like paramExp does for ${(flags)...}.
-	lparen := p.pos
-	old := p.quote
-	p.quote = runeByRune
+// zshSubscript parses a subscript as a word, as zsh treats the text between
+// the brackets like a double-quoted string; see [Assign.Index].
+func (p *Parser) zshSubscript(lpos Pos) ArithmExpr {
+	var flags *FlagsArithm
+	var paren *Lit // leading parentheses which are not flags, kept as text
+	if p.r == '(' {
+		l := p.zshFlags()
+		if zshSubFlagsValid(l.Value) {
+			flags = &FlagsArithm{Flags: l}
+		} else {
+			// zsh evaluates ${a[(1+1)*2]} as arithmetic rather than flags.
+			l.Value = "(" + l.Value + ")"
+			l.ValuePos = posAddCol(l.ValuePos, -1)
+			l.ValueEnd = posAddCol(l.ValueEnd, 1)
+			paren = l
+		}
+	}
+	old, oldDepth := p.quote, p.zshSubDepth
+	p.quote, p.zshSubDepth = zshSubscript, 0
+	p.next()
+	w := p.getWord()
+	p.quote, p.zshSubDepth = old, oldDepth
+	p.matchedArithm(lpos, leftBrack, rightBrack)
+	if paren != nil {
+		if w == nil {
+			w = p.wordOne(paren)
+		} else if first, ok := w.Parts[0].(*Lit); ok {
+			first.Value = paren.Value + first.Value
+			first.ValuePos = paren.ValuePos
+		} else {
+			w.Parts = append([]WordPart{paren}, w.Parts...)
+		}
+	}
+	if flags != nil {
+		if w != nil {
+			flags.X = w
+		}
+		return flags
+	}
+	if w == nil {
+		p.followErrExp(lpos, leftBrack)
+		return nil
+	}
+	return w
+}
+
+// zshSubFlagsValid reports whether the text between the parentheses starting
+// a zsh subscript is a sequence of subscript flags. The flags s, n, and b take
+// an argument between a repeated delimiter, like (s:.:w).
+func zshSubFlagsValid(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case 'w', 'p', 'f', 'r', 'R', 'i', 'I', 'k', 'K', 'e':
+		case 's', 'n', 'b':
+			i++
+			if i >= len(s) {
+				return false
+			}
+			end := strings.IndexByte(s[i+1:], s[i])
+			if end < 0 {
+				return false
+			}
+			i += 1 + end
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// zshFlags lexes parenthesized zsh flags like ${(flags)name} or ${a[(flags)b]},
+// with [Parser.r] at the opening paren, leaving the rune after ')' as next.
+//
+// For now, for simplicity, we parse flags as just a literal.
+// In the future, parsing as a word is better for cases like `${(ps.$sep.)val}`.
+func (p *Parser) zshFlags() *Lit {
+	lparen := p.nextPos()
+	p.rune()
 	p.pos = p.nextPos()
 	for p.newLit(p.r); p.r != runeEOF && p.r != ')'; p.rune() {
 	}
 	p.val = p.endLit()
 	if p.r != ')' {
-		p.tok = _EOF
+		p.tok = _EOF // we can only get here due to EOF
 		p.matchingErr(lparen, leftParen, rightParen)
 	}
-	zf.Flags = p.lit(p.pos, p.val)
+	flags := p.lit(p.pos, p.val)
 	p.rune()
-	// Lex the argument as a raw pattern, stopping at ',' or ']',
-	// since zsh treats it as a pattern rather than an arithmetic expression.
-	argPos := p.nextPos()
-	for p.newLit(p.r); p.r != runeEOF && p.r != ',' && p.r != ']'; p.rune() {
-	}
-	if val := p.endLit(); val != "" {
-		zf.X = p.wordOne(p.lit(argPos, val))
-	}
-	p.quote = old
-	p.next()
-	return zf
+	return flags
 }
 
 func (p *Parser) stopToken() bool {
@@ -2147,17 +2213,14 @@ func (p *Parser) doRedirect(s *Stmt) {
 	case Hdoc, DashHdoc:
 		old := p.quote
 		p.quote, p.forbidNested = hdocWord, true
-		p.heredocs = append(p.heredocs, r)
 		r.Word = p.followWordTok(token(r.Op), r.OpPos)
+		if r.Word != nil {
+			// Only queue heredocs with a word, unlike a broken "<<" alone.
+			p.heredocs = append(p.heredocs, r)
+		}
 		p.quote, p.forbidNested = old, false
 		if p.tok == _Newl {
-			if len(p.accComs) > 0 {
-				c := p.accComs[0]
-				if c.Pos().Line() == s.End().Line() {
-					s.Comments = append(s.Comments, c)
-					p.accComs = p.accComs[1:]
-				}
-			}
+			p.gotLineCom(s)
 			p.doHeredocs()
 		}
 	case WordHdoc:
@@ -2233,14 +2296,28 @@ func (p *Parser) getStmt(readEnd, binCmd, fnBody bool) *Stmt {
 			s.Disown = true
 		}
 	}
-	if len(p.accComs) > 0 && !binCmd && !fnBody {
-		c := p.accComs[0]
-		if c.Pos().Line() == s.End().Line() {
-			s.Comments = append(s.Comments, c)
-			p.accComs = p.accComs[1:]
-		}
+	if !binCmd && !fnBody {
+		p.gotLineCom(s)
 	}
 	return s
+}
+
+// gotLineCom attaches the comment which ended the logical line to s.
+func (p *Parser) gotLineCom(s *Stmt) {
+	if len(p.accComs) > 0 && p.accComs[0].Hash == p.lineCom {
+		s.Comments = append(s.Comments, p.accComs[0])
+		p.accComs = p.accComs[1:]
+	}
+}
+
+// posixReserved reports a word which POSIX says may be reserved with
+// unspecified results, as an error is more helpful than parsing it as a
+// command name. It is only reserved when it starts a command,
+// so not after a redirect.
+func (p *Parser) posixReserved(s *Stmt, pos Pos, feature string) {
+	if len(s.Redirs) == 0 {
+		p.checkLang(pos, langBashLike|LangMirBSDKorn|LangZsh, "%s", feature)
+	}
 }
 
 func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
@@ -2251,14 +2328,14 @@ func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 	redirsStart := len(s.Redirs)
 	switch p.tok {
 	case _LitWord:
+		// Set for POSIX words which [Parser.posixReserved] rejects
+		// unless they name a func declaration.
+		var rsrvFeature string
 		switch p.val {
-		case "{":
-			p.block(s)
-		case "{}":
-			// Zsh treats closing braces in a special way, allowing this.
-			if p.lang.in(LangZsh) {
-				s.Cmd = &Block{Lbrace: p.pos, Rbrace: posAddCol(p.pos, 1)}
-				p.next()
+		case "{", "{}":
+			// Zsh treats closing braces in a special way, allowing "{}".
+			if p.val == "{" || p.lang.in(LangZsh) {
+				p.block(s)
 			}
 		case "if":
 			p.ifClause(s)
@@ -2269,7 +2346,6 @@ func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 			p.forClause(s)
 		case "case":
 			p.caseClause(s)
-		// TODO(zsh): { try-list } "always" { always-list }
 		case "}":
 			p.curErr(`%#q can only be used to close a block`, rightBrace)
 		case "then", "elif":
@@ -2287,12 +2363,13 @@ func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 				p.curErr(`%#q can only be used in full statements`, exclMark)
 				break
 			}
-		case "[[":
-			if p.lang.in(langBashLike | LangMirBSDKorn | LangZsh) {
+		case "[[", "]]":
+			if !p.lang.in(langBashLike | LangMirBSDKorn | LangZsh) {
+				// Unlike `function` and `select`, not valid func names either.
+				p.posixReserved(s, p.pos, "`[[ ]]` tests")
+			} else if p.val == "[[" {
 				p.testClause(s)
-			}
-		case "]]":
-			if p.lang.in(langBashLike | LangMirBSDKorn | LangZsh) {
+			} else {
 				p.curErr(`%#q can only be used to close a test`, dblRightBrack)
 			}
 		case "let":
@@ -2302,6 +2379,8 @@ func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 		case "function":
 			if p.lang.in(langBashLike | LangMirBSDKorn | LangZsh) {
 				p.bashFuncDecl(s)
+			} else {
+				rsrvFeature = "`function` declarations"
 			}
 		case "declare", "local", "export", "readonly", "typeset", "nameref":
 			if p.isDeclKeyword() {
@@ -2318,6 +2397,8 @@ func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 		case "select":
 			if p.lang.in(langBashLike | LangMirBSDKorn | LangZsh) {
 				p.selectClause(s)
+			} else {
+				rsrvFeature = "`select` loops"
 			}
 		case "@test":
 			if p.lang.in(LangBats) {
@@ -2343,6 +2424,9 @@ func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 			}
 			p.funcDecl(s, name.ValuePos, false, true, name)
 		} else {
+			if rsrvFeature != "" {
+				p.posixReserved(s, name.ValuePos, rsrvFeature)
+			}
 			w := p.wordOne(name)
 			if p.lang.in(LangZsh) && !p.spaced {
 				w.Parts = append(w.Parts, p.wordParts(nil)...)
@@ -2452,7 +2536,39 @@ func (p *Parser) arithmExpCmd(s *Stmt) {
 }
 
 func (p *Parser) block(s *Stmt) {
+	b := p.braces()
+	if p.tok != _LitWord || p.val != "always" {
+		s.Cmd = b
+		return
+	}
+	// Zsh's { try-list } always { always-list }, where "always"
+	// must directly follow the closing brace on the same line.
+	p.checkLang(p.pos, LangZsh, "`always` blocks")
+	tc := &TryClause{Try: b, AlwaysPos: p.pos}
+	p.next()
+	for p.got(_Newl) || p.got(semicolon) {
+	}
+	if p.tok == _LitWord && (p.val == "{" || p.val == "{}") {
+		tc.Always = p.braces()
+	} else {
+		if !p.recoverError() {
+			p.followErr(tc.AlwaysPos, "always", "{")
+		}
+		// Keep the node complete even in a partial tree after an error.
+		tc.Always = &Block{Lbrace: recoveredPos, Rbrace: recoveredPos}
+	}
+	s.Cmd = tc
+}
+
+// braces parses a block from its opening brace, which is the current token.
+func (p *Parser) braces() *Block {
 	b := &Block{Lbrace: p.pos}
+	if p.val == "{}" {
+		b.Rbrace = posAddCol(p.pos, 1)
+		b.Last, p.accComs = p.accComs, nil // e.g. `always # c\n{}`
+		p.next()
+		return b
+	}
 	p.next()
 	b.Stmts, b.Last = p.followStmts("{", b.Lbrace, "}")
 	if pos, ok := p.gotRsrv("}"); ok {
@@ -2462,7 +2578,7 @@ func (p *Parser) block(s *Stmt) {
 	} else {
 		p.matchingErr(b.Lbrace, leftBrace, rightBrace)
 	}
-	s.Cmd = b
+	return b
 }
 
 func (p *Parser) ifClause(s *Stmt) {
@@ -3015,10 +3131,6 @@ loop:
 				p.declClause(s, ce.Assigns)
 				return
 			}
-			// Avoid failing later with the confusing "} can only be used to close a block".
-			if p.val == "{" && w != nil && w.Lit() == "function" {
-				p.checkLang(p.pos, langBashLike, `the "function" builtin`)
-			}
 			// Zsh does not require a semicolon to close a block.
 			if p.lang.in(LangZsh) && p.val == "}" {
 				break loop
@@ -3096,6 +3208,9 @@ func (p *Parser) funcDecl(s *Stmt, pos Pos, long, withParens bool, names ...*Lit
 	// TODO: reject any body which isn't a compound command, like a quoted word
 	if fd.Body = p.getStmt(false, false, true); fd.Body == nil {
 		p.followErr(fd.Pos(), "foo()", noQuote("a statement"))
+	} else if tc, ok := fd.Body.Cmd.(*TryClause); ok {
+		// Zsh only allows `always` after a block which is a statement by itself.
+		p.posErr(tc.AlwaysPos, "`always` cannot follow a function body")
 	}
 	if len(names) == 0 && p.lang.in(LangZsh) {
 		p.anonFuncArgs(s, fd)

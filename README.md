@@ -68,6 +68,9 @@ $ echo '${array[dash-string]}' | shfmt
 ${array[dash - string]}
 ```
 
+  This does not apply to Zsh, which only decides at run time whether a
+  subscript is a key or arithmetic, so the parser keeps subscripts as written.
+
 * `$((` and `((` ambiguity is not supported. Backtracking would complicate the
   parser and make streaming support via `io.Reader` impossible. The POSIX spec
   recommends to [space the operands][posix-ambiguity] if `$( (` is meant.
@@ -76,6 +79,10 @@ ${array[dash - string]}
 $ echo '$((foo); (bar))' | shfmt
 1:1: reached ) without matching $(( with ))
 ```
+
+* Unlike Bash, arithmetic expressions are parsed before their words are
+  expanded, so `$((1 ? 1 : $(cmd)))` never runs `cmd`, with `a='1 + 2'`
+  `$(($a * 2))` is 6 rather than 5, and `$((1 $op 2))` is a syntax error.
 
 * `export`, `let`, and `declare` are parsed as keywords.
   This allows statically building their syntax tree,

@@ -54,6 +54,14 @@ func bquoteEscaped(b byte) bool {
 	return false
 }
 
+func dquoteEscaped(b byte) bool {
+	switch b {
+	case '$', '`', '"', '\\':
+		return true
+	}
+	return false
+}
+
 // Sentinel rune values used by [Parser.rune]. They are above [utf8.MaxRune]
 // so that they can never collide with runes decoded from the input.
 const (
@@ -211,6 +219,16 @@ func (p *Parser) nextKeepSpaces() {
 		default:
 			p.advanceLitDquote(r)
 		}
+	case zshSubscript:
+		switch {
+		case r == '`', r == '$':
+			p.tok = p.dqToken(r)
+		case r == ']' && p.zshSubDepth == 0:
+			p.rune()
+			p.tok = rightBrack
+		default:
+			p.advanceLitZshSubscript(r)
+		}
 	case hdocBody, hdocBodyTabs:
 		switch r {
 		case '`', '$':
@@ -241,6 +259,7 @@ func (p *Parser) nextKeepSpaces() {
 }
 
 func (p *Parser) next() {
+	p.lineCom = Pos{}
 	if p.r == runeEOF {
 		p.tok = _EOF
 		return
@@ -319,7 +338,10 @@ skipSpace:
 				case '\n', runeEOF:
 					break runeLoop
 				case escNewl:
+					// A backslash has no meaning in a comment, so treat the
+					// escaped newline as a backslash and a plain newline.
 					p.litBs = append(p.litBs, '\\', '\n')
+					p.r, p.w = '\n', 1
 					break runeLoop
 				case '`':
 					if p.backquoteEnd() {
@@ -336,7 +358,11 @@ skipSpace:
 			} else {
 				p.litBs = nil
 			}
+			hash, trailing := p.pos, p.tok != _Newl
 			p.next()
+			if trailing {
+				p.lineCom = hash
+			}
 		case '[':
 			// `[` only starts an `[idx]=val` element when it begins a new word;
 			// otherwise it continues a glob like `foo[0-9]`.
@@ -1175,6 +1201,31 @@ loop:
 			break loop
 		case '\\': // escaped byte follows
 			p.rune()
+		case escNewl, '`', '$':
+			tok = _Lit
+			break loop
+		}
+	}
+	p.tok, p.val = tok, p.endLit()
+}
+
+// advanceLitZshSubscript lexes a literal in a zsh subscript, which ends at
+// the ']' matching the opening bracket. Quotes are literal, while a backslash
+// escapes the next byte, which is how zsh allows a literal bracket in a key.
+func (p *Parser) advanceLitZshSubscript(r rune) {
+	tok := _LitWord
+loop:
+	for p.newLit(r); r != runeEOF; r = p.rune() {
+		switch r {
+		case '\\': // escaped byte follows
+			p.rune()
+		case '[':
+			p.zshSubDepth++
+		case ']':
+			if p.zshSubDepth == 0 {
+				break loop
+			}
+			p.zshSubDepth--
 		case escNewl, '`', '$':
 			tok = _Lit
 			break loop

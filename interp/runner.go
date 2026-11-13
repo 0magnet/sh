@@ -40,6 +40,37 @@ const (
 	shellReplyVar = "REPLY"
 )
 
+// cmdSubstWriter collects the output of a command substitution, which may
+// be written concurrently or after it is done, such as by background jobs.
+// Once a write fails, such as over the limits in [expand], every runner
+// within it stops; see [Runner.stop].
+type cmdSubstWriter struct {
+	parent *cmdSubstWriter // the enclosing command substitution, if any
+	failed atomic.Bool
+
+	mu sync.Mutex
+	w  io.Writer // [io.Discard] once the substitution is done
+}
+
+func (cw *cmdSubstWriter) Write(p []byte) (int, error) {
+	return cw.write(func(w io.Writer) (int, error) { return w.Write(p) })
+}
+
+// WriteString avoids copying s, as builtins like echo write strings.
+func (cw *cmdSubstWriter) WriteString(s string) (int, error) {
+	return cw.write(func(w io.Writer) (int, error) { return io.WriteString(w, s) })
+}
+
+func (cw *cmdSubstWriter) write(fn func(io.Writer) (int, error)) (int, error) {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	n, err := fn(cw.w)
+	if err != nil {
+		cw.failed.Store(true)
+	}
+	return n, err
+}
+
 func (r *Runner) fillExpandConfig(ctx context.Context) {
 	r.ectx = ctx
 	r.ecfg = &expand.Config{
@@ -71,9 +102,13 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 				return err
 			}
 			r2 := r.subshell(false)
-			r2.stdout = w
+			cw := &cmdSubstWriter{parent: r.cmdSubst, w: w}
+			r2.stdout, r2.cmdSubst = cw, cw
 			r2.stmts(ctx, cs.Stmts)
 			r2.exitSubshell()
+			cw.mu.Lock()
+			cw.w = io.Discard // w may be reused once we return
+			cw.mu.Unlock()
 			r.lastExpandExit = r2.exit
 			if r2.exit.fatalExit {
 				return r2.exit.err // surface fatal errors immediately
@@ -246,6 +281,12 @@ func (r *Runner) literal(word *syntax.Word) string {
 	return str
 }
 
+func (r *Runner) assignWord(word *syntax.Word) string {
+	str, err := expand.AssignValue(r.ecfg, word)
+	r.expandErr(err)
+	return str
+}
+
 func (r *Runner) document(word *syntax.Word) string {
 	str, err := expand.Document(r.ecfg, word)
 	r.expandErr(err)
@@ -314,6 +355,11 @@ func (r *Runner) stop(ctx context.Context) bool {
 	// Some traps trigger on exit, so we do want those to run.
 	if r.exit.discarding || !r.handlingTrap && (r.exit.returning || r.exit.exiting) {
 		return true
+	}
+	for cw := r.cmdSubst; cw != nil; cw = cw.parent {
+		if cw.failed.Load() {
+			return true
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		r.exit.fatal(err)
@@ -659,7 +705,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			r.writeEnv = r.prefixAssigns(cm.Assigns)
 		}
 
-		trace.call(fields[0], fields[1:]...)
+		trace.call(fields)
 		trace.newLineFlush()
 
 		r.call(ctx, cm.Args[0].Pos(), fields)
@@ -792,7 +838,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 					}
 					r.errf("%s", ps3)
 
-					line, err := r.readLine(ctx, true)
+					line, err := r.readLine(ctx, true, '\n', -1)
 					if err != nil {
 						r.errf("\n")
 						r.exit.code = 1
@@ -966,7 +1012,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 				flagsDone = true
 				continue
 			}
-			if fp := (flagParser{remaining: []string{as.Name.Value}}); !flagsDone && fp.more() {
+			if fp := (flagParser{remaining: []string{as.Name.Value}, plus: true}); !flagsDone && fp.more() {
 				for fp.more() {
 					switch flag := fp.flag(); flag {
 					case "-x", "-r":
@@ -1079,7 +1125,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 				}
 			}
 			if err := r.setVarIn(name, vr, scope); err != nil {
-				r.errf("%s: %v\n", cm.Variant.Value, err)
+				r.varErr(fmt.Errorf("%s: %w", cm.Variant.Value, err))
 				r.exit.code = 1
 			}
 		}
@@ -1111,10 +1157,8 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 
 // printDeclare prints a declare command which recreates a variable,
 // like Bash's `declare -p`.
-// Values may be quoted differently than in Bash.
-//
-// TODO: quote values as valid shell input, as %q does not escape "$" or "`"
-// and uses Go escapes for non-printable characters.
+// Values are quoted differently than in Bash,
+// and associative array keys are sorted.
 func (r *Runner) printDeclare(name string, vr expand.Variable) {
 	flags := vr.Flags()
 	if flags == "" {
@@ -1136,19 +1180,19 @@ func (r *Runner) printDeclare(name string, vr expand.Variable) {
 			if vr.Indexes != nil {
 				idx = vr.Indexes[i]
 			}
-			r.outf("[%d]=%q", idx, v)
+			r.outf("[%d]=%s", idx, quoteBash(v))
 		}
 		r.out(")\n")
 	case expand.Associative:
 		r.out("=(")
 		sep := ""
-		for k, v := range vr.Map {
-			r.outf("%s[%s]=%q", sep, k, v)
+		for _, k := range slices.Sorted(maps.Keys(vr.Map)) {
+			r.outf("%s[%s]=%s", sep, quoteBash(k), quoteBash(vr.Map[k]))
 			sep = " "
 		}
 		r.out(")\n")
 	default:
-		r.outf("=%q\n", vr.Str)
+		r.outf("=%s\n", quoteBash(vr.Str))
 	}
 }
 
@@ -1264,7 +1308,9 @@ func (r *Runner) prefixAssigns(assigns []*syntax.Assign) *overlayEnviron {
 		name, prev := r.resolveName(as.Name.Value)
 		scalar := expand.Variable{Set: prev.IsSet(), Kind: expand.String, Str: prev.String()}
 		name, vr, err := r.assignVal(name, scalar, as, "")
-		if err != nil {
+		if err == errAbandoned {
+			break
+		} else if err != nil {
 			continue
 		}
 		vr.Exported = true // always exported
@@ -1409,6 +1455,7 @@ func (r *Runner) hdocReader(rd *syntax.Redirect) (stdinFile, error) {
 
 // hdocQuotedDelim reports whether a here-document delimiter word is quoted,
 // as in "<<'EOF'" or "<<\EOF", which makes its body literal.
+// Keep in sync with unquotedWordBytes in the syntax package.
 func hdocQuotedDelim(word *syntax.Word) bool {
 	for _, wp := range word.Parts {
 		switch wp := wp.(type) {
@@ -1426,8 +1473,6 @@ func hdocQuotedDelim(word *syntax.Word) bool {
 // hdocWord returns a here-document body, or one of its lines, as a string.
 // A quoted delimiter, as in "<<'EOF'", makes the body literal,
 // in which case the parser only gives us literal parts.
-// Note that a partly quoted delimiter, such as "<<'A'B",
-// is not spotted by the parser either, so we still expand its body.
 func (r *Runner) hdocWord(word *syntax.Word, quoted bool) string {
 	if quoted {
 		if lit := word.Lit(); lit != "" {
@@ -1562,9 +1607,7 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (*stmtHold, err
 	case syntax.RdrOut, syntax.RdrAll:
 		mode = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	}
-	// As in bash, a redirection creates files with 0666 masked by the shell's
-	// umask. The default 022 gives 0644, which is what this used to hardcode.
-	f, err := r.open(ctx, arg, mode, 0o666&^os.FileMode(r.umask), false)
+	f, err := r.open(ctx, arg, mode, 0o666, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1686,6 +1729,7 @@ func (r *Runner) open(ctx context.Context, path string, flags int, mode os.FileM
 		return open(ctx, flags)
 	}
 
+	mode &^= r.umask // like bash, apply the shell's umask to created files
 	f, err := r.openHandler(r.handlerCtx(ctx, handlerKindOpen, todoPos), path, flags, mode)
 	// TODO: support wrapped PathError returned from openHandler.
 	switch err.(type) {

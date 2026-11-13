@@ -107,13 +107,22 @@ Nodes:
 - `FuncDecl`: join `Name` and `Names` into one field, even if it is mildly
   annoying to non-Zsh users.
 - `ParamExp`: replace the mutually exclusive booleans `Excl`, `Length`,
-  `Width`, and `IsSet` with a single operator token; rename `Index` to
-  `Subscript`, matching Bash and Zsh terminology; consider joining `Repl`,
+  `Width`, and `IsSet` with a single operator token; consider joining `Repl`,
   `Exp`, and `Slice` into a single expansion field or type.
-- Subscripts are not always arithmetic. Zsh takes associative array keys
-  literally, so parsing `h[foo-bar]` as a subtraction makes the printer
-  break the script (#1233). The type of `Subscript` must allow a word, and
-  Zsh should parse unflagged subscripts as words by default.
+- Subscripts become words in every dialect. Zsh and Bash both expand a
+  subscript like a string and only evaluate it as arithmetic at run time when
+  the array is indexed, so v3 already parses Zsh subscripts as words (#1233).
+  Parsing Bash subscripts as arithmetic mangles keys like `[tx-usecs]=1`,
+  rejects keys like `foo:bar`, and makes `interp` rebuild keys from the tree
+  via `internal/arithm.Word`, losing whitespace. Add a `Subscript` node with
+  `Lbrack` and `Rbrack` positions, a `Flags *Lit` for Zsh flags like `(r)`,
+  and a `Word *Word`. It replaces `Index` in `ParamExp`, `Assign`, and
+  `ArrayElem`, and `ParamExp.Subscripts` becomes `[]*Subscript`. This removes
+  `FlagsArithm`, the guessed closing bracket in the `End` methods of `Assign`
+  and `ArrayElem`, and the printer's compact commas in `${a[1,3]}`. `interp`
+  parses indexed subscripts as arithmetic at run time, caching the result per
+  node. Unlike Zsh, Bash performs quote removal, so `["k"]` keeps a
+  `DblQuoted` part.
 - `ExtGlob`: make extended globs opaque literals, as we did for Zsh glob
   qualifiers. The `expand` package has to stringify the node again anyway, and
   regular glob operators like `*` do not get their own nodes either.
@@ -209,6 +218,12 @@ Parser and printer API:
   modified.
 - `Fields` and `FieldsSeq`: keep both, since the slice form is the common case,
   but name them consistently with the parser iterators.
+- `Literal` needs a clearer name. It expands a word into a single string
+  without field splitting or globbing, so nothing about it is literal, and the
+  name suggests the unexpanded `syntax.Lit`. It serves many contexts, such as
+  test operands, case words, and redirections, so unlike `Document`, `Pattern`,
+  and `AssignValue`, its name should describe the result rather than a
+  context. Candidates are `Field`, pairing with `Fields`, and `String`.
 
 ### interp
 
@@ -470,8 +485,10 @@ runs, but behaves differently. The guide lists them first.
 - `pattern`: a zero `Mode` matches the entire string rather than part of it,
   and no longer supports `**`.
 - `syntax`: a zero dialect is unset rather than Bash.
-- `syntax`: Zsh subscripts without flags are words rather than arithmetic
-  expressions.
+- `syntax`: Bash and mksh subscripts are words rather than arithmetic
+  expressions, like Zsh subscripts already are in v3. `shfmt` no longer
+  normalizes the spacing in `${a[i+1]}`, and arithmetic syntax errors in a
+  subscript are reported by `interp` at run time rather than by the parser.
 - `fileutil`: `Shebang` returns the whole command, and for any program.
 - `interp`, `expand`: on Windows, variable names are case-sensitive, and
   only a few names like `Path` are upper-cased.
@@ -532,8 +549,8 @@ was designed which should shape the new API.
   default, so a default other than zero needs a way to ask for zero, such
   as a negative kill timeout to kill right away.
 - **Room for additions.** The features wanted by open issues fit the new
-  API without another break. More dialects such as ksh (#614) and
-  pre-POSIX (#757) are bits in the `uint32`, of which five are in use.
+  API without another break. More dialects such as ksh (#614) are bits in
+  the `uint32`, of which five are in use.
   A cursor to replace nodes while walking (#1165) and parsing without
   building a tree (#621) are a new function and method. A limit on
   ambiguous parsing (#686) and a single process mode (#171) are options
@@ -562,11 +579,9 @@ was designed which should shape the new API.
 - Whether to keep js/wasm support for the interpreter, which currently forces
   `Stdin` to be an `io.Reader` and adds in-process pipes.
 - Which of the many formatter feature requests without a v4 dependency should
-  still be batched here, so that users see one round of diffs. Those which
-  were put off as breaking in v3 are keeping `do` on its own line in a
-  multi-line `for` (#582), not printing a multi-line command inline (#720),
-  and rejecting `[[` in POSIX mode (#1092). #1064 suggests a function style
-  option taking the place of `FunctionNextLine`.
+  still be batched here, so that users see one round of diffs. Not printing
+  a multi-line command inline (#720) was put off as breaking in v3. #1064
+  suggests a function style option taking the place of `FunctionNextLine`.
 
 ## TODO
 
@@ -583,9 +598,10 @@ Disagreements and decisions which need confirming:
   Confirm with go-task, the main user on Windows.
 - TODO: a `Shebang` which works for any program is only floated in #846;
   decide whether it belongs in v4.
-- TODO: Zsh subscripts as words are proposed as an opt-in parser option for
-  v3. Decide whether v4 makes them the default, and whether flagged
-  subscripts like `${a[(r)b]}` and `FlagsArithm` change as well.
+- TODO: confirm that subscripts as words for Bash and mksh are worth a
+  run-time arithmetic parse in `interp` and losing `shfmt`'s spacing of
+  `${a[i+1]}`, as the Bash corpus has about four arithmetic subscripts for
+  every associative key.
 - TODO: decide between removing `FunctionNextLine` outright and turning it
   into a function style option (#1064), as both cannot happen.
 - TODO: settle each "consider" in the inventory one way or the other:
@@ -600,10 +616,10 @@ Gaps in the design:
 - TODO: a middleware which overrides a builtin cannot change the shell's
   state, as `HandlerContext` is read-only. Replacing `cd` or `export` is
   then not possible; decide whether that is a goal (#93).
-- TODO: the last command of a pipeline runs in the current shell, so
-  `echo a | read x` sets `x`, unlike in Bash, and pipes are closed late
-  (#1142). Fixing it changes what scripts observe, so it would be a silent
-  behavior change.
+- TODO: the shell holds its ends of a pipeline's pipes until the whole
+  pipeline finishes (#1142), so a reader sees no EOF and a writer no SIGPIPE
+  when the other side stops early. Fixing it changes what scripts observe,
+  so it would be a silent behavior change.
 - TODO: builtins like `history` need the caller's help (#1401), as the
   history belongs to the line editor. Decide whether that is another
   handler, or left to a middleware which overrides the builtin.

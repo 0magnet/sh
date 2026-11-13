@@ -379,6 +379,7 @@ var metaTests = []struct {
 	{`[a\]`, false, `\[a\\]`},
 	{`[[:wrong:]]`, true, `\[\[:wrong:]]`},
 	{`[[:`, false, `\[\[:`},
+	{"\xff*", true, "\xff\\*"}, // invalid UTF-8 is kept as-is
 }
 
 func TestMeta(t *testing.T) {

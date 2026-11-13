@@ -199,6 +199,11 @@ var fileTests = []fileTestCase{
 		langFile(litWord("foo")),
 	),
 	fileTest(
+		// A backslash does not continue a comment onto the next line.
+		[]string{"foo #\\\nbar", "foo #\\\r\nbar"},
+		langFile(litStmts("foo", "bar")),
+	),
+	fileTest(
 		[]string{`\`},
 		printsAs(`\\`),
 		langFile(litWord(`\`)),
@@ -474,10 +479,7 @@ var fileTests = []fileTestCase{
 		[]string{"${a[abs(-2)]}"},
 		langFile(&ParamExp{
 			Param: lit("a"),
-			Index: &CallArithm{
-				Name: lit("abs"),
-				Args: []ArithmExpr{&UnaryArithm{Op: Minus, X: litWord("2")}},
-			},
+			Index: litWord("abs(-2)"),
 		}, LangZsh),
 	),
 	fileTest(
@@ -730,7 +732,24 @@ var fileTests = []fileTestCase{
 	),
 	fileTest(
 		[]string{"select foo bar"},
-		langFile(litStmt("select", "foo", "bar"), LangPOSIX),
+		langErr2("1:1: `select` loops are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+		flipConfirm2(LangPOSIX), // dash runs it as a command
+	),
+	fileTest(
+		[]string{"select i in a; do b; done"},
+		langErr2("1:1: `select` loops are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+	),
+	fileTest(
+		[]string{"echo select"},
+		langFile(litCall("echo", "select")),
+	),
+	fileTest(
+		[]string{"select() { a; }"},
+		langFile(&FuncDecl{
+			Parens: true,
+			Name:   lit("select"),
+			Body:   stmt(block(litStmt("a"))),
+		}, LangPOSIX),
 	),
 	fileTest(
 		[]string{`' ' "foo bar"`},
@@ -955,7 +974,7 @@ var fileTests = []fileTestCase{
 			Name:     lit("foo"),
 			Body:     stmt(block(litStmt("a"), litStmt("b"))),
 		}, LangBash|LangMirBSDKorn|LangZsh),
-		langErr2("1:13: the `function` builtin is a bash feature; tried parsing as LANG", LangPOSIX),
+		langErr2("1:1: `function` declarations are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
 	),
 	fileTest(
 		[]string{
@@ -969,6 +988,19 @@ var fileTests = []fileTestCase{
 		}, LangBash|LangMirBSDKorn|LangZsh),
 	),
 	fileTest(
+		[]string{"function foo\n{\n\ta\n}"},
+		langErr2("1:1: `function` declarations are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+		flipConfirm2(LangPOSIX), // dash runs it as a command and a block
+	),
+	fileTest(
+		[]string{"function() { a; }"},
+		langFile(&FuncDecl{
+			Parens: true,
+			Name:   lit("function"),
+			Body:   stmt(block(litStmt("a"))),
+		}, LangPOSIX),
+	),
+	fileTest(
 		[]string{"function foo() (a)"},
 		langFile(&FuncDecl{
 			RsrvWord: true,
@@ -976,7 +1008,7 @@ var fileTests = []fileTestCase{
 			Name:     lit("foo"),
 			Body:     stmt(subshell(litStmt("a"))),
 		}, LangBash),
-		langErr2("1:13: the `function` builtin is a bash feature; tried parsing as LANG", LangPOSIX),
+		langErr2("1:1: `function` declarations are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
 	),
 	fileTest(
 		[]string{"function f1 f2 f3() {\n\ta\n}"},
@@ -1671,14 +1703,40 @@ var fileTests = []fileTestCase{
 		}),
 	),
 	fileTest(
-		[]string{"foo <<\"EOF\"2\nbar\nEOF2"},
+		[]string{"foo <<\"EOF\"2\n$bar\nEOF2"},
 		langFile(&Stmt{
 			Cmd: litCall("foo"),
 			Redirs: []*Redirect{{
 				Op:   Hdoc,
 				Word: word(dblQuoted(lit("EOF")), lit("2")),
-				Hdoc: litWord("bar\n"),
+				Hdoc: litWord("$bar\n"),
 			}},
+		}),
+	),
+	fileTest(
+		[]string{"foo <<'EOF'2\n$bar\nEOF2"},
+		langFile(&Stmt{
+			Cmd: litCall("foo"),
+			Redirs: []*Redirect{{
+				Op:   Hdoc,
+				Word: word(sglQuoted("EOF"), lit("2")),
+				Hdoc: litWord("$bar\n"),
+			}},
+		}),
+	),
+	fileTest(
+		// Within double quotes, a backslash only escapes $, `, ", or \.
+		[]string{"foo <<\"EOF\\$\\`\\\"\\\\\\q\"\nbar\nEOF$`\"\\\\q\nEOF\\$\\`\\\"\\\\\\q"},
+		langFile([]*Stmt{
+			{
+				Cmd: litCall("foo"),
+				Redirs: []*Redirect{{
+					Op:   Hdoc,
+					Word: word(dblQuoted(lit("EOF\\$\\`\\\"\\\\\\q"))),
+					Hdoc: litWord("bar\n"),
+				}},
+			},
+			litStmt("EOF\\$\\`\\\"\\\\\\q"),
 		}),
 	),
 	fileTest(
@@ -2390,6 +2448,42 @@ var fileTests = []fileTestCase{
 		langFile(block(), LangZsh),
 	),
 	fileTest(
+		[]string{"{ foo; } always { bar; }", "{ foo; } always\n{ bar; }", "{ foo; } always ; ;\n{ bar; }"},
+		langFile(&TryClause{
+			Try:    block(litStmt("foo")),
+			Always: block(litStmt("bar")),
+		}, LangZsh),
+		langErr2("1:10: `always` blocks are a zsh feature; tried parsing as LANG", LangPOSIX|LangBash|LangMirBSDKorn),
+	),
+	fileTest(
+		[]string{
+			"{\n\tfoo\n} always {\n\tbar\n}",
+			"{\nfoo\n} always {\nbar\n}",
+		},
+		langFile(&TryClause{
+			Try:    block(litStmt("foo")),
+			Always: block(litStmt("bar")),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{"{ } always { }", "{} always {}", "{ } always\n{ }"},
+		langFile(&TryClause{Try: block(), Always: block()}, LangZsh),
+	),
+	fileTest(
+		[]string{"{ foo; } always { bar; } >a | baz"},
+		langFile(&BinaryCmd{
+			Op: Pipe,
+			X: &Stmt{
+				Cmd: &TryClause{
+					Try:    block(litStmt("foo")),
+					Always: block(litStmt("bar")),
+				},
+				Redirs: []*Redirect{{Op: RdrOut, Word: litWord("a")}},
+			},
+			Y: litStmt("baz"),
+		}, LangZsh),
+	),
+	fileTest(
 		[]string{"( )"},
 		langErr2("1:1: `(` must be followed by a statement list"),
 		langFile(subshell(), LangZsh|LangMirBSDKorn),
@@ -3077,15 +3171,27 @@ var fileTests = []fileTestCase{
 		), LangZsh),
 	),
 	fileTest(
-		[]string{
-			`${foo[1]}`,
-			`${foo[ 1 ]}`,
-		},
+		[]string{`${foo[1]}`},
 		langFile(&ParamExp{
 			Param: lit("foo"),
 			Index: litWord("1"),
 		}, LangBash|LangMirBSDKorn|LangZsh),
 		langErr2("1:6: arrays are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+	),
+	fileTest(
+		[]string{`${foo[ 1 ]}`},
+		printsAs(`${foo[1]}`),
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("1"),
+		}, LangBash|LangMirBSDKorn),
+	),
+	fileTest(
+		[]string{`${foo[ 1 ]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord(" 1 "),
+		}, LangZsh),
 	),
 	fileTest(
 		[]string{`$foo[1]`},
@@ -3129,8 +3235,22 @@ var fileTests = []fileTestCase{
 				X:  litWord("1"),
 				Y:  litWord("3"),
 			},
-		}, LangBash|LangMirBSDKorn|LangZsh),
+		}, LangBash|LangMirBSDKorn),
 		langErr2("1:6: arrays are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+	),
+	fileTest(
+		[]string{`${foo[1,3]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("1,3"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[ 1 , 3 ]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord(" 1 , 3 "),
+		}, LangZsh),
 	),
 	fileTest(
 		[]string{`${var[1][2]}`},
@@ -3150,18 +3270,8 @@ var fileTests = []fileTestCase{
 				Flags: lit("r"),
 				X:     litWord("f*"),
 			},
-			Subscripts: []ArithmExpr{
-				&BinaryArithm{
-					Op: Comma,
-					X:  litWord("1"),
-					Y:  litWord("2"),
-				},
-				&UnaryArithm{
-					Op: Minus,
-					X:  litWord("1"),
-				},
-			},
-			Exp: &Expansion{Op: DefaultUnsetOrNull, Word: litWord("x")},
+			Subscripts: []ArithmExpr{litWord("1,2"), litWord("-1")},
+			Exp:        &Expansion{Op: DefaultUnsetOrNull, Word: litWord("x")},
 		}, LangZsh),
 	),
 	fileTest(
@@ -3193,7 +3303,11 @@ var fileTests = []fileTestCase{
 				X:  litWord("cmd"),
 				Y:  litWord("#"),
 			},
-		}, LangBash|LangMirBSDKorn|LangZsh),
+		}, LangBash|LangMirBSDKorn),
+		langFile(&ParamExp{
+			Param: lit("args"),
+			Index: litWord("cmd,#"),
+		}, LangZsh),
 		langErr2("1:7: arrays are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
 	),
 	fileTest(
@@ -3208,27 +3322,25 @@ var fileTests = []fileTestCase{
 					X:  litWord("1"),
 				},
 			},
-		}, LangBash|LangMirBSDKorn|LangZsh),
+		}, LangBash|LangMirBSDKorn),
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("1,-1"),
+		}, LangZsh),
 		langErr2("1:6: arrays are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
 	),
 	fileTest(
 		[]string{`${@[-1]}`},
 		langFile(&ParamExp{
 			Param: lit("@"),
-			Index: &UnaryArithm{
-				Op: Minus,
-				X:  litWord("1"),
-			},
+			Index: litWord("-1"),
 		}, LangZsh),
 	),
 	fileTest(
 		[]string{`${*[-1]}`},
 		langFile(&ParamExp{
 			Param: lit("*"),
-			Index: &UnaryArithm{
-				Op: Minus,
-				X:  litWord("1"),
-			},
+			Index: litWord("-1"),
 		}, LangZsh),
 	),
 	fileTest(
@@ -3236,11 +3348,7 @@ var fileTests = []fileTestCase{
 		langFile(&ParamExp{
 			Short: true,
 			Param: lit("foo"),
-			Index: &BinaryArithm{
-				Op: Comma,
-				X:  litWord("1"),
-				Y:  litWord("3"),
-			},
+			Index: litWord("1,3"),
 		}, LangZsh),
 	),
 	fileTest(
@@ -3318,16 +3426,50 @@ var fileTests = []fileTestCase{
 		[]string{`${foo[(r)ab,(r)cd]}`},
 		langFile(&ParamExp{
 			Param: lit("foo"),
-			Index: &BinaryArithm{
-				Op: Comma,
-				X: &FlagsArithm{
-					Flags: lit("r"),
-					X:     litWord("ab"),
-				},
-				Y: &FlagsArithm{
-					Flags: lit("r"),
-					X:     litWord("cd"),
-				},
+			Index: &FlagsArithm{
+				Flags: lit("r"),
+				X:     litWord("ab,(r)cd"),
+			},
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[(n:2:)4]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: &FlagsArithm{
+				Flags: lit("n:2:"),
+				X:     litWord("4"),
+			},
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[(1+1)*2]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("(1+1)*2"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[(1+1)*$x]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: word(lit("(1+1)*"), litParamExp("x")),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{"${foo[a\\\nb]}"},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: word(lit("a"), lit("b")),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[(e)*]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: &FlagsArithm{
+				Flags: lit("e"),
+				X:     litWord("*"),
 			},
 		}, LangZsh),
 	),
@@ -3339,7 +3481,115 @@ var fileTests = []fileTestCase{
 				Op: Minus,
 				X:  litWord("1"),
 			},
-		}, LangBash|LangMirBSDKorn|LangZsh),
+		}, LangBash|LangMirBSDKorn),
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("-1"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[i + 1]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("i + 1"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[foo-bar]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("foo-bar"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`$foo[foo-bar]`},
+		langFile(&ParamExp{
+			Short: true,
+			Param: lit("foo"),
+			Index: litWord("foo-bar"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[foo:bar]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("foo:bar"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[foo bar]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("foo bar"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[x?y!z]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("x?y!z"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[a\]b]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord(`a\]b`),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[a[b]c]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord("a[b]c"),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo["k"]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: litWord(`"k"`),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[$k-1]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: word(litParamExp("k"), lit("-1")),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[${k}-1]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: word(&ParamExp{Param: lit("k")}, lit("-1")),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[$(cmd)-x]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: word(cmdSubst(litStmt("cmd")), lit("-x")),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`${foo[$bar[1]]}`},
+		langFile(&ParamExp{
+			Param: lit("foo"),
+			Index: word(&ParamExp{
+				Short: true,
+				Param: lit("bar"),
+				Index: litWord("1"),
+			}),
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{`((foo[foo-bar]))`},
+		langFile(arithmCmd(word(&ParamExp{
+			Short: true,
+			Param: lit("foo"),
+			Index: litWord("foo-bar"),
+		})), LangZsh),
 	),
 	fileTest(
 		[]string{`${foo[@]}`},
@@ -4520,7 +4770,44 @@ var fileTests = []fileTestCase{
 	fileTest(
 		[]string{"[[ a ]]"},
 		langFile(&TestClause{X: litWord("a")}, LangBash|LangMirBSDKorn|LangZsh),
-		langFile(litStmt("[[", "a", "]]"), LangPOSIX),
+		langErr2("1:1: `[[ ]]` tests are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+		flipConfirm2(LangPOSIX), // dash runs it as a command
+	),
+	fileTest(
+		[]string{"foo | [[ a ]]"},
+		langFile(&BinaryCmd{
+			Op: Pipe,
+			X:  litStmt("foo"),
+			Y:  stmt(&TestClause{X: litWord("a")}),
+		}, LangBash|LangMirBSDKorn|LangZsh),
+		langErr2("1:7: `[[ ]]` tests are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+		flipConfirm2(LangPOSIX), // dash runs it as a command
+	),
+	fileTest(
+		[]string{"echo [[ a ]]"},
+		langFile(litCall("echo", "[[", "a", "]]")),
+	),
+	fileTest(
+		[]string{"]] a"},
+		langErr2("1:1: `[[ ]]` tests are a bash/mksh/zsh feature; tried parsing as LANG", LangPOSIX),
+		flipConfirm2(LangPOSIX), // dash runs it as a command
+	),
+	// Words after a prefix are never reserved.
+	fileTest(
+		[]string{"x=1 [[ a ]]"},
+		langFile(&CallExpr{
+			Assigns: litAssigns("x=1"),
+			Args:    litWords("[[", "a", "]]"),
+		}, LangPOSIX|LangBash|LangMirBSDKorn),
+	),
+	fileTest(
+		[]string{">f [[ a ]]\n>f ]] a\n>f select x\n>f function foo"},
+		langFile([]*Stmt{
+			{Cmd: litCall("[[", "a", "]]"), Redirs: []*Redirect{{Op: RdrOut, Word: litWord("f")}}},
+			{Cmd: litCall("]]", "a"), Redirs: []*Redirect{{Op: RdrOut, Word: litWord("f")}}},
+			{Cmd: litCall("select", "x"), Redirs: []*Redirect{{Op: RdrOut, Word: litWord("f")}}},
+			{Cmd: litCall("function", "foo"), Redirs: []*Redirect{{Op: RdrOut, Word: litWord("f")}}},
+		}, LangPOSIX),
 	),
 	fileTest(
 		[]string{"[[ a ]]\nb"},
@@ -5418,8 +5705,8 @@ var fileTests = []fileTestCase{
 		}}}, LangZsh),
 	),
 	fileTest(
-		[]string{"a[2]=b c[-3]= d[x]+=e"},
-		langFile(litStmt("a[2]=b", "c[-3]=", "d[x]+=e"), LangPOSIX),
+		[]string{"a[2]=b c[3]= d[x]+=e"},
+		langFile(litStmt("a[2]=b", "c[3]=", "d[x]+=e"), LangPOSIX),
 		langFile(&CallExpr{Assigns: []*Assign{
 			{
 				Name:  lit("a"),
@@ -5427,11 +5714,8 @@ var fileTests = []fileTestCase{
 				Value: litWord("b"),
 			},
 			{
-				Name: lit("c"),
-				Index: &UnaryArithm{
-					Op: Minus,
-					X:  litWord("3"),
-				},
+				Name:  lit("c"),
+				Index: litWord("3"),
 			},
 			{
 				Name:   lit("d"),
@@ -5442,6 +5726,31 @@ var fileTests = []fileTestCase{
 		}}, LangBash|LangMirBSDKorn|LangZsh),
 	),
 	fileTest(
+		[]string{"a[foo-bar]=b"},
+		langFile(litStmt("a[foo-bar]=b"), LangPOSIX),
+		langFile(&CallExpr{Assigns: []*Assign{{
+			Name:  lit("a"),
+			Index: litWord("foo-bar"),
+			Value: litWord("b"),
+		}}}, LangZsh),
+	),
+	fileTest(
+		[]string{"typeset -A a=([foo-bar]=b)"},
+		langFile(&DeclClause{
+			Variant: lit("typeset"),
+			Args: []*Assign{
+				{Naked: true, Value: litWord("-A")},
+				{
+					Name: lit("a"),
+					Array: &ArrayExpr{Elems: []*ArrayElem{{
+						Index: litWord("foo-bar"),
+						Value: litWord("b"),
+					}}},
+				},
+			},
+		}, LangZsh),
+	),
+	fileTest(
 		[]string{"*[i]=x"},
 		langFile(word(lit("*"), lit("[i]=x")), LangBash|LangMirBSDKorn|LangZsh),
 		langFile(lit("*[i]=x"), LangPOSIX),
@@ -5449,27 +5758,30 @@ var fileTests = []fileTestCase{
 	fileTest(
 		[]string{"arr[0,1]=x"},
 		langFile(&CallExpr{Assigns: []*Assign{{
-			Name: lit("arr"),
-			Index: &BinaryArithm{
-				Op: Comma,
-				X:  litWord("0"),
-				Y:  litWord("1"),
-			},
+			Name:  lit("arr"),
+			Index: litWord("0,1"),
 			Value: litWord("x"),
 		}}}, LangZsh),
 		langFile(lit("arr[0,1]=x"), LangPOSIX),
 	),
 	fileTest(
-		[]string{
-			"b[i]+=2",
-			"b[ i ]+=2",
-		},
+		[]string{"b[i]+=2"},
 		langFile(&CallExpr{Assigns: []*Assign{{
 			Append: true,
 			Name:   lit("b"),
 			Index:  litWord("i"),
 			Value:  litWord("2"),
 		}}}, LangBash|LangMirBSDKorn|LangZsh),
+	),
+	fileTest(
+		[]string{"b[ i ]+=2"},
+		printsAs("b[i]+=2"),
+		langFile(&CallExpr{Assigns: []*Assign{{
+			Append: true,
+			Name:   lit("b"),
+			Index:  litWord("i"),
+			Value:  litWord("2"),
+		}}}, LangBash|LangMirBSDKorn),
 	),
 	fileTest(
 		[]string{`$((a + "b + $c"))`},
@@ -5516,7 +5828,16 @@ var fileTests = []fileTestCase{
 				Index: word(dblQuoted(lit("x y"))),
 			}),
 			Y: litWord("b"),
-		}), LangBash|LangMirBSDKorn|LangZsh),
+		}), LangBash|LangMirBSDKorn),
+		langFile(arithmCmd(&BinaryArithm{
+			Op: Assgn,
+			X: word(&ParamExp{
+				Short: true,
+				Param: lit("a"),
+				Index: litWord(`"x y"`),
+			}),
+			Y: litWord("b"),
+		}), LangZsh),
 	),
 	fileTest(
 		[]string{
@@ -6000,6 +6321,68 @@ var fileTestsKeepComments = []fileTestCase{
 		}),
 	),
 	fileTest(
+		[]string{
+			"foo # bar",
+			"foo \\\n# bar",
+			"foo \\\n\t# bar\n",
+			"foo \\\n\\\n# bar",
+		},
+		langFile(&File{
+			Stmts: []*Stmt{{
+				Comments: []Comment{{Text: " bar"}},
+				Cmd:      litCall("foo"),
+			}},
+		}),
+	),
+	fileTest(
+		[]string{"foo #\\\nbar"},
+		langFile(&File{
+			Stmts: []*Stmt{
+				{
+					Comments: []Comment{{Text: `\`}},
+					Cmd:      litCall("foo"),
+				},
+				{
+					Comments: []Comment{},
+					Cmd:      litCall("bar"),
+				},
+			},
+		}),
+	),
+	fileTest(
+		[]string{
+			"foo bar <<EOF # c\nbody\nEOF",
+			"foo <<EOF bar # c\nbody\nEOF",
+			"foo <<EOF \\\n\tbar \\\n\t# c\nbody\nEOF",
+		},
+		langFile(&File{
+			Stmts: []*Stmt{{
+				Comments: []Comment{{Text: " c"}},
+				Cmd:      litCall("foo", "bar"),
+				Redirs: []*Redirect{{
+					Op:   Hdoc,
+					Word: litWord("EOF"),
+					Hdoc: litWord("body\n"),
+				}},
+			}},
+		}),
+	),
+	fileTest(
+		[]string{"foo &&\n\t# bar\n\tbaz", "foo &&\n# bar\nbaz"},
+		langFile(&File{
+			Stmts: []*Stmt{{
+				Cmd: &BinaryCmd{
+					Op: AndStmt,
+					X:  litStmt("foo"),
+					Y: &Stmt{
+						Comments: []Comment{{Text: " bar"}},
+						Cmd:      litCall("baz"),
+					},
+				},
+			}},
+		}),
+	),
+	fileTest(
 		[]string{"foo # bar # baz"},
 		langFile(&File{
 			Stmts: []*Stmt{{
@@ -6007,6 +6390,23 @@ var fileTestsKeepComments = []fileTestCase{
 				Cmd:      litCall("foo"),
 			}},
 		}),
+	),
+	fileTest(
+		[]string{"{ foo; } always { # c\n}", "{ foo; } always # c\n{}", "{ foo; } always # c\n{ }"},
+		langFile(&TryClause{
+			Try:    block(litStmt("foo")),
+			Always: &Block{Last: []Comment{{Text: " c"}}},
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{"{ foo; } always { # c\n\tbar\n}", "{ foo; } always # c\n{ bar; }"},
+		langFile(&TryClause{
+			Try: block(litStmt("foo")),
+			Always: block(&Stmt{
+				Comments: []Comment{{Text: " c"}},
+				Cmd:      litCall("bar"),
+			}),
+		}, LangZsh),
 	),
 	fileTest(
 		[]string{
@@ -6026,6 +6426,56 @@ var fileTestsKeepComments = []fileTestCase{
 		langFile(&CmdSubst{
 			Last: []Comment{{Text: " foo"}},
 		}),
+	),
+	fileTest(
+		[]string{"if foo; then\n\t# bar\nfi"},
+		langFile(&IfClause{
+			Cond:     litStmts("foo"),
+			ThenLast: []Comment{{Text: " bar"}},
+			Last:     []Comment{},
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{"if foo; then\n\tbar\nelif baz; then\n\t# c\nelse\n\t# d\nfi"},
+		langFile(&IfClause{
+			Cond: litStmts("foo"),
+			Then: litStmts("bar"),
+			Else: &IfClause{
+				Cond:     litStmts("baz"),
+				ThenLast: []Comment{{Text: " c"}},
+				Else: &IfClause{
+					ThenLast: []Comment{{Text: " d"}},
+					Last:     []Comment{},
+				},
+				Last: []Comment{},
+			},
+		}, LangZsh),
+	),
+	fileTest(
+		[]string{"while foo; do\n\t# bar\ndone"},
+		langFile(&WhileClause{
+			Cond:   litStmts("foo"),
+			DoLast: []Comment{{Text: " bar"}},
+		}, LangZsh|LangMirBSDKorn),
+	),
+	fileTest(
+		[]string{"for i; do\n\t# bar\ndone"},
+		langFile(&ForClause{
+			Loop:   &WordIter{Name: lit("i")},
+			DoLast: []Comment{{Text: " bar"}},
+		}, LangZsh|LangMirBSDKorn),
+	),
+	fileTest(
+		[]string{"{\n\t# foo\n}"},
+		langFile(&Block{
+			Last: []Comment{{Text: " foo"}},
+		}, LangZsh|LangMirBSDKorn),
+	),
+	fileTest(
+		[]string{"(\n\t# foo\n)"},
+		langFile(&Subshell{
+			Last: []Comment{{Text: " foo"}},
+		}, LangZsh|LangMirBSDKorn),
 	),
 }
 
@@ -6061,10 +6511,11 @@ func (c sanityChecker) checkPos(node Node, pos Pos, strs ...string) {
 		}
 		got = strings.ReplaceAll(got, "\x00", "")
 		got = strings.ReplaceAll(got, "\r\n", "\n")
-		if !strings.Contains(want, "\\\n") {
-			// Hack to let "foobar" match the input "foo\\\nbar".
-			got = strings.ReplaceAll(got, "\\\n", "")
+		if strings.HasPrefix(got, want) {
+			return
 		}
+		// Hack to let "foobar" match the input "foo\\\nbar".
+		got = strings.ReplaceAll(got, "\\\n", "")
 		if strings.HasPrefix(got, want) {
 			return
 		}
@@ -6176,6 +6627,8 @@ func (c sanityChecker) visit(node Node) bool {
 	case *Block:
 		c.checkPos(node, node.Lbrace, "{")
 		c.checkPos(node, node.Rbrace, "}")
+	case *TryClause:
+		c.checkPos(node, node.AlwaysPos, "always")
 	case *IfClause:
 		if node.ThenPos.IsValid() {
 			c.checkPos(node, node.Position, "if", "elif")

@@ -16,6 +16,8 @@
 // Note that hanlders do not provide a sandbox or any other sort of OS-level isolation.
 // For example, an [OpenHandler] refusing access to the /etc directory
 // can be foiled by [ExecHandler] allowing access to external programs like cat.
+// Expansions and the values of variables are limited in size; see [expand].
+// Scripts can still use unbounded memory or time over many commands.
 //
 // The interpreter currently aims to behave like a non-interactive shell,
 // which is how most shells run scripts, and is more useful to machines.
@@ -82,16 +84,11 @@ type Runner struct {
 	// tempDir is either $TMPDIR from [Runner.Env], or [os.TempDir].
 	tempDir string
 
-	// umask is the file mode creation mask reported and set by the umask
-	// builtin. Redirections which create a file mask 0666 with it, as in
-	// bash, and pass the result to the open handler.
-	//
-	// Note that on a real OS the process umask applies on top of this, since
-	// it is applied by the kernel rather than by [DefaultOpenHandler]. They
-	// are the same value in bash, where the shell's umask is the process's;
-	// here they are separate, and this one is what a custom open handler —
-	// backed by an in-memory filesystem, say — has to honor itself.
-	umask uint32
+	// umask is the file mode creation mask, as set by the umask builtin.
+	// It starts at 022 regardless of the process umask, which the kernel
+	// still applies on top, and only affects files created by redirections,
+	// as external commands do not inherit it.
+	umask os.FileMode
 
 	// Params are the current shell parameters, e.g. from running a shell
 	// file or calling a function. Accessible via the $@/$* family of vars.
@@ -242,6 +239,10 @@ type Runner struct {
 	// bgDropHolds is set on a background job until its statement has set
 	// its standard streams; see [Runner.dropUnusedHolds].
 	bgDropHolds bool
+
+	// cmdSubst is the innermost command substitution this runner is within,
+	// if any, which stops the runner once it fails; see [Runner.stop].
+	cmdSubst *cmdSubstWriter
 
 	opts runnerOpts
 
@@ -601,7 +602,7 @@ func BackgroundContext(ctx context.Context) RunnerOption {
 // See [BashOpts] for the Bash options which "set" cannot change.
 func Params(args ...string) RunnerOption {
 	return func(r *Runner) error {
-		fp := flagParser{remaining: args}
+		fp := flagParser{remaining: args, plus: true}
 		for fp.more() {
 			flag := fp.flag()
 			if flag == "-" || flag == "+" {
@@ -1125,9 +1126,9 @@ func (r *Runner) Reset() {
 	}
 	// reset the internal state
 	*r = Runner{
-		umask:                0o022,
 		Env:                  r.Env,
 		tempDir:              r.tempDir,
+		umask:                0o022,
 		callHandler:          r.callHandler,
 		execHandler:          r.execHandler,
 		execHandlerIsDefault: r.execHandlerIsDefault,
@@ -1466,6 +1467,7 @@ func (r *Runner) subshell(background bool) *Runner {
 		holds:                r.inheritedHolds(),
 		historyList:          r.historyList,
 		historyClear:         r.historyClear,
+		cmdSubst:             r.cmdSubst,
 
 		origStdout: r.origStdout, // used for process substitutions
 	}

@@ -398,9 +398,12 @@ func (r *Runner) envGet(name string) string {
 }
 
 // varErr reports a variable error, if any, and returns it for the caller
-// to fail the command at hand.
+// to fail the command at hand. A fatal error, such as a value over the
+// limits in [expand], abandons the current commands like an expansion error.
 func (r *Runner) varErr(err error) error {
-	if err != nil {
+	if _, ok := errors.AsType[internal.FatalError](err); ok {
+		r.expandErr(err)
+	} else if err != nil {
 		r.errf("%v\n", err)
 	}
 	return err
@@ -498,6 +501,10 @@ const (
 // errReadOnly is returned when trying to modify a read-only variable.
 var errReadOnly = errors.New("readonly variable")
 
+// errAbandoned is returned by [Runner.assignVal] when an expansion error
+// abandoned the current commands, which it has already reported.
+var errAbandoned = errors.New("assignment abandoned")
+
 // randomMax is one past the highest value that RANDOM expands to, like in Bash.
 const randomMax = 32768
 
@@ -507,6 +514,11 @@ const randomMax = 32768
 func (r *Runner) setVarIn(name string, vr expand.Variable, scope declScope) error {
 	if r.opts[optAllExport] {
 		vr.Exported = true
+	}
+	// An array is bounded like the fields of an expansion, as it can
+	// outgrow them via a+=(...). Strings are checked where they are built.
+	if len(vr.List) > internal.MaxExpandFields || len(vr.Map) > internal.MaxExpandFields {
+		return internal.Fatalf("%s: value would exceed %d elements", name, internal.MaxExpandFields)
 	}
 	var err error
 	switch scope {
@@ -666,10 +678,16 @@ func (r *Runner) convertKind(name string, vr expand.Variable, valType string) (e
 // valType is "-a", "-A", or "-n" when a declaration builtin gives the kind.
 // The name is returned too, as a nameref is resolved first.
 // Errors are handled like in [Runner.delVar].
+// Like Bash, an expansion error which abandons the current commands
+// leaves the variable unchanged, returning [errAbandoned].
 func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign, valType string) (string, expand.Variable, error) {
+	exiting := r.exit.exiting
+	abandoned := func() bool { return r.exit.exiting && !exiting }
 	str := ""
 	if as.Value != nil {
-		str = r.literal(as.Value)
+		if str = r.assignWord(as.Value); abandoned() {
+			return name, prev, errAbandoned
+		}
 	}
 	if prev.Kind == expand.NameRef && prev.Str == "" && valType != "-n" {
 		// Assigning to a nameref without a target, like `declare -n r; r=x`,
@@ -693,7 +711,7 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 		return name, prev, err
 	}
 	if as.Array != nil {
-		prev, err := r.assignArray(name, prev, as)
+		prev, err := r.assignArray(name, prev, as, abandoned)
 		return name, prev, err
 	}
 	// A scalar value like x=y or x[i]+=y; `x=` has no value at all.
@@ -703,7 +721,9 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 	case prev.Kind == expand.Associative:
 		key := "0"
 		if as.Index != nil {
-			key = r.assocKey(as.Index)
+			if key = r.assocKey(as.Index); abandoned() {
+				return name, prev, errAbandoned
+			}
 		}
 		// TODO: only clone when inside a subshell and getting a var from outside for the first time
 		prev.Map = maps.Clone(prev.Map)
@@ -741,12 +761,19 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 		}
 		prev.Kind, prev.Str = expand.String, str
 	}
+	// Appending can grow a value past the limits in [expand].
+	if len(str) > internal.MaxExpandSize {
+		r.expandErr(internal.Fatalf("%s: value would exceed %d bytes", name, internal.MaxExpandSize))
+		return name, prev, errAbandoned
+	}
 	prev.Set = true
 	return name, prev, nil
 }
 
-// assignArray implements [Runner.assignVal] for an array value.
-func (r *Runner) assignArray(name string, prev expand.Variable, as *syntax.Assign) (expand.Variable, error) {
+// assignArray implements [Runner.assignVal] for an array value,
+// returning [errAbandoned] once abandoned reports that an expansion error
+// abandoned the current commands.
+func (r *Runner) assignArray(name string, prev expand.Variable, as *syntax.Assign, abandoned func() bool) (expand.Variable, error) {
 	elems := as.Array.Elems
 	assoc := prev.Kind == expand.Associative
 	if prev.Kind == expand.Unknown && len(elems) > 0 && stringIndex(elems[0].Index) {
@@ -775,13 +802,19 @@ func (r *Runner) assignArray(name string, prev expand.Variable, as *syntax.Assig
 				} else {
 					amap[key] = word
 				}
+				if abandoned() {
+					return prev, errAbandoned
+				}
 			}
 		} else {
 			for _, elem := range elems {
 				if elem.Index == nil {
 					return prev, r.failVar("%s: %s: must use subscript when assigning associative array", name, r.literal(elem.Value))
 				}
-				amap[r.assocKey(elem.Index)] = r.literal(elem.Value)
+				amap[r.assocKey(elem.Index)] = r.assignWord(elem.Value)
+				if abandoned() {
+					return prev, errAbandoned
+				}
 			}
 		}
 		prev.Kind, prev.Str = expand.Associative, ""
@@ -811,7 +844,7 @@ func (r *Runner) assignArray(name string, prev expand.Variable, as *syntax.Assig
 			if index, ok = internal.IndexedAbs(list, indexes, i); !ok {
 				return prev, r.failVar("%s: bad array subscript", name)
 			}
-			list, indexes = internal.SetIndexedElem(list, indexes, index, r.literal(elem.Value))
+			list, indexes = internal.SetIndexedElem(list, indexes, index, r.assignWord(elem.Value))
 			index++
 		} else {
 			// Implicit index, advancing for every word.
@@ -819,6 +852,14 @@ func (r *Runner) assignArray(name string, prev expand.Variable, as *syntax.Assig
 				list, indexes = internal.SetIndexedElem(list, indexes, index, val)
 				index++
 			}
+		}
+		if abandoned() {
+			return prev, errAbandoned
+		}
+		// Each word may add a million elements, so stop before the next one;
+		// [Runner.setVarIn] fails on the result.
+		if len(list) > internal.MaxExpandFields {
+			break
 		}
 	}
 	if list == nil {

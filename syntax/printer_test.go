@@ -39,6 +39,35 @@ func TestPrintFiles(t *testing.T) {
 	}
 }
 
+// TestPrintZsh covers formatting which only arises with zsh syntax,
+// as [TestPrintFiles] only prints the canonical input of each case.
+func TestPrintZsh(t *testing.T) {
+	t.Parallel()
+	parser := NewParser(Variant(LangZsh), KeepComments(true))
+	printer := NewPrinter()
+	for _, tc := range []printCase{
+		{"{ foo; } always\n{ bar; }", "{ foo; } always { bar; }"},
+		{"{ foo; } always # c\n{ bar; }", "{ foo; } always { # c\n\tbar\n}"},
+		{"{ foo; } always # c\n{}", "{ foo; } always { # c\n}"},
+		{"{ foo; } always # c\n{ }", "{ foo; } always { # c\n}"},
+		samePrint("if a & then; fi"),
+		samePrint("while a & do; done"),
+	} {
+		t.Run("", func(t *testing.T) {
+			printTest(t, parser, printer, tc.in, tc.want)
+		})
+	}
+	minifier := NewPrinter(Minify(true))
+	for _, tc := range []printCase{
+		{"if a & then; elif b & then; else; fi", "if a&then;elif b&then;else;fi"},
+		{"while a & do; done", "while a&do;done"},
+	} {
+		t.Run("", func(t *testing.T) {
+			printTest(t, parser, minifier, tc.in, tc.want)
+		})
+	}
+}
+
 func strPrint(p *Printer, node Node) (string, error) {
 	var buf bytes.Buffer
 	err := p.Print(&buf, node)
@@ -84,6 +113,11 @@ var printTests = []printCase{
 	samePrint("foo; continue"),
 	samePrint("foo; ! exit 1"),
 	samePrint("foo & exit 1"),
+	samePrint("{ echo $(a &); }"),
+	samePrint("{ echo >$(a &); }"),
+	samePrint("for f in $(a &); do b; done"),
+	samePrint("select f in <(a &); do b; done"),
+	samePrint("for f in x; do case a in b) c ;; esac; done"),
 	samePrint("cat <<DOC; exit 1\nbody\nDOC"),
 	{"foo; exit 1; bar", "foo; exit 1\nbar"},
 	{"if a; then b; exit 1; fi", "if a; then\n\tb; exit 1\nfi"},
@@ -102,6 +136,7 @@ var printTests = []printCase{
 	samePrint("#c1\\\n#c2"),
 	samePrint("#\\\n#"),
 	{"#\\\r\n#", "#\\\n#"},
+	{"foo #\\\r\nbar", "foo #\\\nbar"},
 	samePrint("{\n\tfoo\n\t# bar \\\n}"),
 	samePrint("foo\\\\\nbar"),
 	samePrint("a=b # inline\nbar"),
@@ -122,6 +157,7 @@ var printTests = []printCase{
 	{"foo <<EOF bar\nl1\nEOF", "foo bar <<EOF\nl1\nEOF"},
 	samePrint("foo <<\\\\\\\\EOF\nbar\n\\\\EOF"),
 	samePrint("foo <<\"\\EOF\"\nbar\n\\EOF"),
+	samePrint("foo <<'EOF'2\nbar\\\nEOF2"),
 	samePrint("foo <<\"EOF\"\nbar\nEOF\nbar"),
 	samePrint("foo <<EOF && bar\nl1\nEOF"),
 	samePrint("foo <<EOF &&\nl1\nEOF\n\tbar"),
@@ -234,10 +270,7 @@ var printTests = []printCase{
 		"foo bar # 1\n! foo # 2",
 		"foo bar # 1\n! foo   # 2",
 	},
-	{
-		"aa #b\nc  #d\ne\nf #g",
-		"aa #b\nc  #d\ne\nf #g",
-	},
+	samePrint("aa #b\nc  #d\ne\nf #g"),
 	{
 		"{ a; } #x\nbbb #y\n{ #z\nc\n}",
 		"{ a; } #x\nbbb    #y\n{      #z\n\tc\n}",
@@ -465,6 +498,30 @@ var printTests = []printCase{
 		"[[ a && \\\nb \\\n && c ]]",
 		"[[ a &&\n\tb &&\n\tc ]]",
 	},
+	{
+		"[[ a\n]]; foo",
+		"[[ a ]]\nfoo",
+	},
+	{
+		"[[ a\n]] # comment",
+		"[[ a ]] # comment",
+	},
+	{
+		"((a\n)) && b",
+		"((a)) && b",
+	},
+	{
+		"((a\n)) # comment",
+		"((a)) # comment",
+	},
+	{
+		"((a + (1\n) + 2))",
+		"((a + (1) + 2))",
+	},
+	{
+		"[[ (a\n) && b ]]",
+		"[[ (a) && b ]]",
+	},
 	samePrint("{\n\t[[ a || b ]]\n}"),
 	{
 		"a=(\nb\nc\n) b=c",
@@ -589,6 +646,38 @@ var printTests = []printCase{
 	samePrint("f <<EOF # inline\n$(\n\t# inside\n)\nEOF\n# outside\nbar"),
 	samePrint("while foo; do\n\tbar\ndone <<-EOF # inline\n\tbaz\nEOF"),
 	samePrint("{\n\tcat <<EOF\nEOF\n\t# comment\n}"),
+	// A trailing comment may follow an escaped newline.
+	samePrint("foo \\\n\tbar \\\n\t# comment\n\nbaz"),
+	samePrint("foo \\\n\t# comment\nbar"),
+	samePrint("{\n\tfoo \\\n\t\tbar \\\n\t\t# comment\n}"),
+	samePrint("case x in\na)\n\tfoo \\\n\t\t# comment\n\t;;\nesac"),
+	samePrint("foo >bar \\\n\t# comment"),
+	samePrint("foo & \\\n\t# comment"),
+	samePrint("f() { foo; } \\\n\t# comment"),
+	samePrint("foo &&\n\tbar \\\n\t# comment"),
+	samePrint("foo |\n\tbar \\\n\t# comment"),
+	samePrint("cat <<EOF \\\n\t# comment\nbody\nEOF"),
+	samePrint("<<EOF \\\n\t# comment\nbody\nEOF"),
+	{
+		"foo <<EOF \\\n\tbar \\\n\t# comment\nbody\nEOF",
+		"foo \\\n\tbar <<EOF \\\n\t# comment\nbody\nEOF",
+	},
+	{
+		"foo; \\\n\t# comment",
+		"foo \\\n\t# comment",
+	},
+	{
+		"foo \\\n\\\n\t\t# comment",
+		"foo \\\n\t# comment",
+	},
+	{
+		"foo && \\\n\t# comment\n\tbar",
+		"foo &&\n\t# comment\n\tbar",
+	},
+	{
+		"a=(x \\\n\t# comment\n)",
+		"a=(x\n\t# comment\n)",
+	},
 	{
 		"if foo # inline\nthen\n\tbar\nfi",
 		"if foo; then # inline\n\tbar\nfi",
@@ -700,6 +789,11 @@ var printTests = []printCase{
 		"(\n\t((foo++))\n\tbar\n)",
 	},
 	samePrint("(foo && (bar) )"),
+	// The formatted output of single-line sources such as "$( (foo; bar) )"
+	// or "`(foo; bar)`".
+	samePrint("$( (\n\tfoo\n\tbar\n) )"),
+	samePrint("( (\n\tfoo\n\tbar\n) )"),
+	samePrint("$(foo && (\n\tbar\n\tbaz\n) )"),
 	samePrint("( (foo) >redir)"),
 	samePrint("(\n\t((foo++))\n)"),
 	samePrint("(foo && bar)"),
@@ -932,14 +1026,8 @@ func TestPrintBinaryNextLine(t *testing.T) {
 			"echo $((a +\nb))",
 			"echo $((a \\\n\t+ b))",
 		},
-		{
-			"a \\\n\tb \\\n\tc \\\n\t# EOC",
-			"a \\\n\tb \\\n\tc\n# EOC",
-		},
-		{
-			"a \\\n\t| b \\\n\t| c \\\n\t# EOC",
-			"a \\\n\t| b \\\n\t| c\n# EOC",
-		},
+		samePrint("a \\\n\tb \\\n\tc \\\n\t# EOC"),
+		samePrint("a \\\n\t| b \\\n\t| c \\\n\t# EOC"),
 	}
 	parser := NewParser(KeepComments(true))
 	printer := NewPrinter(BinaryNextLine(true))
@@ -1247,6 +1335,30 @@ func TestPrintMinify(t *testing.T) {
 			"case $a in\nx)c;;\ny|z)d\nesac",
 		},
 		{
+			"{ case a in b) c ;; d) ;; esac; }",
+			"{ case a in b)c;;d)esac;}",
+		},
+		{
+			"case a in b) ;; esac",
+			"case a in b)esac",
+		},
+		{
+			"{ case a in b) ;; esac; }",
+			"{ case a in b)esac;}",
+		},
+		{
+			"case a in (esac) ;; esac",
+			"case a in (esac) esac",
+		},
+		{
+			"case a in (esac)\nesac",
+			"case a in (esac)\nesac",
+		},
+		{
+			"case a in (esac) b ;; c) ;; esac",
+			"case a in (esac) b;;c)esac",
+		},
+		{
 			"a && b | c",
 			"a&&b|c",
 		},
@@ -1273,6 +1385,30 @@ func TestPrintMinify(t *testing.T) {
 			"(cat <<EOF\n hello\nEOF\n)",
 		},
 		samePrint("diff -y <(cat <<EOF\n1\n2\n3\nEOF\n) <(cat <<EOF\n1\n4\n3\nEOF\n)"),
+		{
+			"$(foo && (bar\nbaz) )",
+			"$(foo&&(bar\nbaz) )",
+		},
+		{
+			"( (foo)\n# c\n)",
+			"( (foo) )",
+		},
+		{
+			"(a\n); foo",
+			"(a)\nfoo",
+		},
+		{
+			"(a\n) 3>&1",
+			"(a) 3>&1",
+		},
+		{
+			"a=(b\n) >out",
+			"a=(b) >out",
+		},
+		{
+			"foo <<EOF \\\n\t# comment\nbody\nEOF",
+			"foo <<EOF\nbody\nEOF",
+		},
 	}
 	parser := NewParser(KeepComments(true))
 	printer := NewPrinter(Minify(true))
